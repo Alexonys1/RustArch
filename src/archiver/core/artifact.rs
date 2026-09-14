@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::io::{self, Read, Write, Seek, SeekFrom};
 use std::fs::{self, File, OpenOptions};
 use std::sync::{Mutex, OnceLock};
@@ -7,9 +8,6 @@ use std::num::NonZeroUsize;
 
 use crate::algorithms::PipelineSettings;
 use super::memory_budget::BudgetGuard;
-
-
-// TODO: Добавить буфферизированное чтение файлов!
 
 
 pub const DEFAULT_CHUNK_SIZE_IN_BYTES: usize = 512 * 1024; // 512KB
@@ -110,6 +108,61 @@ impl Artifact {
         }
     }
 
+    pub fn on_disk(&self) -> bool {
+        match &self.state {
+            ArtifactState::File { .. } => true,
+            ArtifactState::FileWindow { .. } => true,
+            _ => false,
+        }
+    }
+
+    /// Если данные на диске, то будет возвращён None.
+    /// Если данные в оперативной памяти, то будет возвращён Some
+    pub fn new__next_mut_chunk(&mut self) -> io::Result<Option<&mut [u8]>> {
+        match &mut self.state {
+            ArtifactState::File { .. } => Ok(None),
+            ArtifactState::Memory { data, .. } => {
+                let to_read_bytes = data.len().saturating_sub(self.reading_position);
+                let result = Ok(Some(&mut data[self.reading_position..self.reading_position + to_read_bytes]));
+                self.reading_position += to_read_bytes;
+                result
+            }
+            ArtifactState::FileWindow { .. } => Ok(None),
+        }
+    }
+
+    /// Как это должно было выглядеть!
+    pub fn new__next_chunk(&mut self) -> io::Result<Cow<'_, [u8]>> {
+        match &mut self.state {
+            ArtifactState::File { file, .. } => {
+                file.seek(SeekFrom::Start(self.reading_position as u64))?; // TODO: А нужно ли?
+                let mut buffer = vec![0; self.chunk_size.get()];
+                self.reading_position += file.read(&mut buffer)?;
+
+                Ok(Cow::Owned(buffer))
+            }
+            ArtifactState::Memory { data, .. } => {
+                let to_read_bytes = data.len().saturating_sub(self.reading_position);
+                self.reading_position += to_read_bytes;
+
+                Ok(Cow::Borrowed(&data[self.reading_position..self.reading_position + to_read_bytes]))
+            }
+            ArtifactState::FileWindow { file, base_offset, len } => {
+                let to_read = (*len).saturating_sub(self.reading_position as u64);
+
+                if to_read == 0 {
+                    return Ok(Cow::Owned(vec![]));
+                }
+
+                file.seek(SeekFrom::Start(*base_offset + self.reading_position as u64))?;
+                let mut buffer = vec![0; self.chunk_size.get()];
+                self.reading_position += file.read(&mut buffer)?;
+
+                Ok(Cow::Owned(buffer))
+            }
+        }
+    }
+
     /// Читает до `chunk_size` байт (или меньше, если `buf` меньше) с
     /// текущей позиции чтения. `0` означает конец данных.
     pub fn read_chunk(&mut self, buf: &mut [u8]) -> io::Result<usize> {
@@ -118,7 +171,7 @@ impl Artifact {
 
         match &mut self.state {
             ArtifactState::File { file, .. } => {
-                file.seek(SeekFrom::Start(self.reading_position as u64))?;
+                file.seek(SeekFrom::Start(self.reading_position as u64))?; // TODO: А нужно ли?
 
                 let mut filled = 0;
                 while filled < actual_buf.len() {

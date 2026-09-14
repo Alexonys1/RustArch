@@ -1,15 +1,17 @@
+use super::{Compressor, compression};
+use super::{Cipher, crypto};
+use super::{ErrorCorrectionCode, fec};
 use crate::error::AppError;
-use super::{compression, Compressor};
-use super::{crypto, Cipher};
-use super::{fec, ErrorCorrectionCode};
 
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompressionId {
     NoCompression = 0,
-    Rle = 1,
+    RLE = 1,
     Huffman = 2,
-    Lz77 = 3,
+    LZ77 = 3,
+    LZSS = 4,
+    Deflate = 5,
 }
 
 impl CompressionId {
@@ -18,26 +20,33 @@ impl CompressionId {
     }
 
     pub fn get(self) -> Box<dyn Compressor> {
+        use CompressionId::*;
         match self {
-            CompressionId::NoCompression => Box::new(compression::NoneCompressor),
-            CompressionId::Rle => Box::new(compression::rle::RleCompressor),
-            CompressionId::Huffman => Box::new(compression::huffman::HuffmanCompressor),
-            CompressionId::Lz77 => Box::new(compression::lz77::Lz77Compressor::default()),
+            NoCompression => Box::new(compression::NoneCompressor),
+            RLE => Box::new(compression::RleCompressor),
+            Huffman => Box::new(compression::HuffmanCompressor),
+            LZ77 => Box::new(compression::Lz77Compressor),
+            LZSS => Box::new(compression::LzssCompressor),
+            Deflate => Box::new(compression::DeflateCompressor),
         }
     }
 
     pub fn from_u8(v: u8) -> Result<Self, AppError> {
+        use CompressionId::*;
         match v {
-            0 => Ok(CompressionId::NoCompression),
-            1 => Ok(CompressionId::Rle),
-            2 => Ok(CompressionId::Huffman),
-            3 => Ok(CompressionId::Lz77),
+            0 => Ok(NoCompression),
+            1 => Ok(RLE),
+            2 => Ok(Huffman),
+            3 => Ok(LZ77),
+            4 => Ok(LZSS),
+            5 => Ok(Deflate),
             other => Err(AppError::CorruptArchive(format!(
-                "неизвестный compression_id: {other}"
+                "Неизвестный compression_id: {other}"
             ))),
         }
     }
 }
+
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CipherId {
@@ -51,22 +60,25 @@ impl CipherId {
     }
 
     pub fn get(self) -> Box<dyn Cipher> {
+        use CipherId::*;
         match self {
-            CipherId::NoCipher => Box::new(crypto::NoneCipher),
-            CipherId::Xor => Box::new(crypto::xor::XorCipher),
+            NoCipher => Box::new(crypto::NoneCipher),
+            Xor => Box::new(crypto::XorCipher),
         }
     }
 
     pub fn from_u8(v: u8) -> Result<Self, AppError> {
+        use CipherId::*;
         match v {
-            0 => Ok(CipherId::NoCipher),
-            1 => Ok(CipherId::Xor),
+            0 => Ok(NoCipher),
+            1 => Ok(Xor),
             other => Err(AppError::CorruptArchive(format!(
-                "неизвестный cipher_id: {other}"
+                "Неизвестный cipher_id: {other}"
             ))),
         }
     }
 }
+
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FecId {
@@ -81,18 +93,19 @@ impl FecId {
     }
 
     pub fn get(self) -> Box<dyn ErrorCorrectionCode> {
+        use FecId::*;
         match self {
-            FecId::NoFec => Box::new(fec::NoneFec),
-            FecId::Hamming7_4 => Box::new(fec::hamming::HammingCode::new_7_4()),
-            FecId::Hamming15_11 => Box::new(fec::hamming::HammingCode::new_15_11()),
+            NoFec => Box::new(fec::NoneFec),
+            Hamming => Box::new(fec::HammingCode::new_7_4()),
         }
     }
 
     pub fn from_u8(v: u8) -> Result<Self, AppError> {
+        use FecId::*;
         match v {
-            0 => Ok(FecId::NoFec),
-            1 => Ok(FecId::Hamming7_4),
-            2 => Ok(FecId::Hamming15_11),
+            0 => Ok(NoFec),
+            1 => Ok(Hamming7_4),
+            2 => Ok(Hamming15_11),
             other => Err(AppError::CorruptArchive(format!(
                 "Неизвестный fec_id: {other}"
             ))),

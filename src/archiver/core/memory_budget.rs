@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicI64, Ordering};
 
 
-pub const MEMORY_LIMIT_IN_BYTES: i64 = 8 * 1024_i64.pow(3); // 8GB
+pub const MEMORY_LIMIT_IN_BYTES: i64 = 6 * 1024_i64.pow(3); // 6GB
 pub static MEMORY_BUDGET_IN_BYTES: AtomicI64 = AtomicI64::new(MEMORY_LIMIT_IN_BYTES);
 
 

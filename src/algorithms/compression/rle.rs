@@ -79,6 +79,6 @@ impl Compressor for RleCompressor {
     }
 
     fn id(&self) -> CompressionId {
-        CompressionId::Rle
+        CompressionId::RLE
     }
 }

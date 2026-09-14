@@ -8,6 +8,7 @@
 //! Считается потоково (`update` можно вызывать многократно кусками),
 //! чтобы не требовать держать весь файл в памяти ради контрольной суммы.
 
+use crate::algorithms::{PipelineSettings, CipherId};
 use crate::archiver::Artifact;
 
 
@@ -54,7 +55,13 @@ impl Default for Crc32 {
 }
 
 
-pub fn crc32_of_artifact_and_rewind(artifact: &mut Artifact) -> std::io::Result<u32> {
+/// Если NoCipher, то crc32 всегда равен u32::MAX.
+pub fn crc32_of_artifact_and_rewind(artifact: &mut Artifact, pipeline_settings: PipelineSettings) -> std::io::Result<u32> {
+    if pipeline_settings.cipher == CipherId::NoCipher {
+        artifact.rewind_reading();
+        return Ok(u32::MAX)  // Просто заглушка
+    }
+
     let mut crc32 = Crc32::new();
     let chunk_size: usize = artifact.chunk_size.get();
     let mut buffer = vec![0; chunk_size]; // Нужно именно передать заполненный вектор,

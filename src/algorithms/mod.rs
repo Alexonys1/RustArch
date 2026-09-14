@@ -8,5 +8,5 @@ pub use compression::Compressor;
 pub use crypto::Cipher;
 pub use fec::ErrorCorrectionCode;
 pub use settings::PipelineSettings;
-pub use ids::{CompressionId, CipherId, FecId};
+pub use ids::*;
 

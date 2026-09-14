@@ -32,7 +32,8 @@ pub fn unpack_file(entry: &ArchiveEntry, archive_path: &Path, output_dir: &Path,
     original_artifact.save_as_finish_file(&output_path)?; // !!РАСПАКОВЫВАЕМ ЗДЕСЬ!!
 
     let mut check_artifact: Artifact = Artifact::from_file(&output_path)?;
-    let actual_crc32: u32 = crc32_of_artifact_and_rewind(&mut check_artifact)?;
+    let actual_crc32: u32 = crc32_of_artifact_and_rewind(&mut check_artifact, pipeline_settings)?;
+    // Если было NoCipher, то actual_crc32 всегда одинаковый.
 
     if actual_crc32 != entry.crc32 {
         return Err(AppError::ChecksumMismatch { path: output_path.display().to_string() });

@@ -16,6 +16,14 @@ pub struct WalkResult {
 }
 
 
+impl WalkedFile {
+    pub fn get_size(&self) -> Result<u64, AppError> {
+        let metadata = std::fs::metadata(self.absolute_path.as_path())?;
+        Ok(metadata.len())
+    }
+}
+
+
 // TODO: Наверное, эти дженерики всё-таки лишние и можно было обойтись обычным &Path
 pub fn walk_directory_or_file<RootPath: AsRef<Path>>(root: &RootPath) -> Result<WalkResult, AppError> {
     let root = root.as_ref(); // Дженерики в приватных функциях были правда лишние, пока я не додумался до let root = root.as_ref()

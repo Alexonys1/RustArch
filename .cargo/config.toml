@@ -1,0 +1,2 @@
+[alias]
+prof = "samply record cargo run -- --release --bin RustArch"

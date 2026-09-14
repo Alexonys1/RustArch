@@ -1,10 +1,18 @@
-pub mod rle;
-pub mod huffman;
-pub mod lz77;
+mod rle;
+mod huffman;
+mod deflate;
+mod lz;
+mod utils;
 
-use crate::error::AppError;
-use crate::archiver::Artifact;
+pub use deflate::DeflateCompressor;
+pub use huffman::HuffmanCompressor;
+pub use lz::Lz77Compressor;
+pub use lz::LzssCompressor;
+pub use rle::RleCompressor;
+
 use super::ids::CompressionId;
+use crate::archiver::Artifact;
+use crate::error::AppError;
 
 
 pub trait Compressor {
@@ -26,9 +34,11 @@ impl Compressor for NoneCompressor {
     fn compress(&self, artifact: Artifact) -> Result<Artifact, AppError> {
         Ok(artifact)
     }
+
     fn decompress(&self, artifact: Artifact) -> Result<Artifact, AppError> {
         Ok(artifact)
     }
+
     fn id(&self) -> CompressionId {
         CompressionId::NoCompression
     }

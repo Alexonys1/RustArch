@@ -1,4 +1,6 @@
-pub mod xor;
+mod xor;
+
+pub use xor::XorCipher;
 
 use crate::error::AppError;
 use crate::archiver::Artifact;

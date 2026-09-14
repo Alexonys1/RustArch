@@ -1,4 +1,6 @@
-pub mod hamming;
+mod hamming;
+
+pub use hamming::HammingCode;
 
 use crate::error::AppError;
 use crate::archiver::Artifact;

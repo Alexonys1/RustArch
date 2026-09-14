@@ -1,10 +1,11 @@
-mod cli;
-mod error;
-mod algorithms;
-mod archiver;
+pub mod cli;
+pub mod error;
+pub mod archiver;
+pub mod algorithms;
+//mod gui;
 
-use crate::cli::{CLICommand, run_pack, run_unpack};
-use crate::algorithms::{CipherId, CompressionId, FecId, PipelineSettings};
+use crate::cli::{ CLICommand, run_pack, run_unpack };
+use crate::algorithms::{ CipherId, CompressionId, FecId, PipelineSettings };
 
 
 fn main() {
@@ -21,25 +22,29 @@ fn main() {
      */
 
     // ========== Для теста: ==========
-    let cli_command = CLICommand::Pack {
-        source_path: r"C:/Games/Battlefield 2142 Novgames RST".into(), // Важно, что эти относительные пути именно строки,
-        target_archive_path: r"./test_data_for_removing/test_data.arch".into(), // которые можно менять
-        settings: PipelineSettings {
-            compression: CompressionId::NoCompression,
-            cipher: CipherId::Xor,
-            fec: FecId::NoFec,
+
+    enum TestCLICommand { Pack, Unpack, }
+    let test_choice = TestCLICommand::Pack; // !МЕНЯТЬ ЗДЕСЬ!
+
+    let cli_command: CLICommand = match test_choice {
+        TestCLICommand::Pack => CLICommand::Pack {
+            source_path: r"C:\Users\alex\Desktop\Предметы на следующий семестр".into(), // Важно, что эти относительные пути именно строки,
+            target_archive_path: r".\test_data_for_removing\study.arch".into(), // которые можно менять
+            settings: PipelineSettings {
+                compression: CompressionId::Huffman,
+                cipher: CipherId::Xor,
+                fec: FecId::NoFec,
+            },
+            encode_key: (1..=255).collect(), // Подбирать 255-БАЙТНЫЙ ключ полным перебором - это увлекательное дело!
         },
-        encode_key: vec![1_u8, 2, 3, 4],
-    };
 
-    /*
-    let cli_command = CLICommand::Unpack {
-        source_path: r"tests/test_data.arch".into(),
-        target_unpack_path: "tests/kal".into(),
-        decode_key: vec![5, 5, 2, 3, 1, 43],
-    };
-     */
+        TestCLICommand::Unpack => CLICommand::Unpack {
+            source_path: r"test_data_for_removing/study.arch".into(),
+            target_unpack_path: "test_data_for_removing/study".into(),
+            decode_key: (1..=255).collect(),
+        },
 
+    };
 
     let start = std::time::Instant::now();
     let archive_result = match cli_command {
@@ -59,10 +64,18 @@ fn main() {
         _ => todo!(),
     };
     let elapsed = start.elapsed();
+
+    use std::os::windows::fs::MetadataExt;
+    let archive_size_in_gb: f64 = std::fs::metadata(r"C:\Users\alex\RustroverProjects\RustArch\test_data_for_removing\study.arch")
+        .unwrap().file_size() as f64 / 1024_f64.powi(3);
+
     println!("\n===> TOTAL TIME: {}ms", elapsed.as_millis());
+    println!(  "===> TOTAL SIZE: {:.2}GB", archive_size_in_gb);
 
     if let Err(e) = archive_result {
         eprintln!("Ошибка: {e}");
         std::process::exit(1);
     }
+
+    //let _ = gui::run();
 }
