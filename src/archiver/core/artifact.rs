@@ -131,34 +131,56 @@ impl Artifact {
         }
     }
 
-    /// Как это должно было выглядеть!
-    pub fn new__next_chunk(&mut self) -> io::Result<Cow<'_, [u8]>> {
+    /// Возвращает Ok(Some(Cow)) длиной <= chunk_size, если данные можно прочесть.
+    /// Если данные закончились (курсор уехал за пределы файла или массива), то вернётся Ok(None).
+    pub fn new__next_chunk(&mut self) -> io::Result<Option<Cow<'_, [u8]>>> {
         match &mut self.state {
             ArtifactState::File { file, .. } => {
-                file.seek(SeekFrom::Start(self.reading_position as u64))?; // TODO: А нужно ли?
+                file.seek(SeekFrom::Start(self.reading_position as u64))?;
                 let mut buffer = vec![0; self.chunk_size.get()];
-                self.reading_position += file.read(&mut buffer)?;
+                let n = file.read(&mut buffer)?;
 
-                Ok(Cow::Owned(buffer))
-            }
-            ArtifactState::Memory { data, .. } => {
-                let to_read_bytes = data.len().saturating_sub(self.reading_position);
-                self.reading_position += to_read_bytes;
-
-                Ok(Cow::Borrowed(&data[self.reading_position..self.reading_position + to_read_bytes]))
-            }
-            ArtifactState::FileWindow { file, base_offset, len } => {
-                let to_read = (*len).saturating_sub(self.reading_position as u64);
-
-                if to_read == 0 {
-                    return Ok(Cow::Owned(vec![]));
+                if n == 0 {
+                    return Ok(None);
                 }
 
-                file.seek(SeekFrom::Start(*base_offset + self.reading_position as u64))?;
-                let mut buffer = vec![0; self.chunk_size.get()];
-                self.reading_position += file.read(&mut buffer)?;
+                self.reading_position += n;
+                buffer.truncate(n);
 
-                Ok(Cow::Owned(buffer))
+                Ok(Some(Cow::Owned(buffer)))
+            }
+
+            ArtifactState::Memory { data, .. } => {
+                if self.reading_position >= data.len() {
+                    return Ok(None);
+                }
+                let start = self.reading_position;
+                let end = (start + self.chunk_size.get()).min(data.len());
+                self.reading_position = end;
+
+                Ok(Some(Cow::Borrowed(&data[start..end])))
+            }
+
+            ArtifactState::FileWindow { file, base_offset, len } => {
+                let remaining = (*len).saturating_sub(self.reading_position as u64);
+
+                if remaining == 0 {
+                    return Ok(None);
+                }
+
+                let want = remaining.min(self.chunk_size.get() as u64) as usize;
+                file.seek(SeekFrom::Start(*base_offset + self.reading_position as u64))?;
+                let mut buffer = vec![0; want];
+                let n = file.read(&mut buffer)?;
+
+                if n == 0 {
+                    return Ok(None);
+                }
+
+                self.reading_position += n;
+                buffer.truncate(n);
+
+                Ok(Some(Cow::Owned(buffer)))
             }
         }
     }

@@ -1,3 +1,6 @@
+use std::borrow::Cow;
+use std::slice;
+
 use crate::error::AppError;
 use crate::archiver::Artifact;
 use super::{Cipher, CipherId};
@@ -14,10 +17,8 @@ impl Cipher for XorCipher {
             let mut output = Artifact::new_with_temp_file_suffix(&artifact, "encoded");
             let mut key_pos: usize = 0;
 
-            loop {
-                let mut chunk: Vec<u8> = artifact.new__next_chunk()?.into();
-
-                if chunk.is_empty() { break }
+            while let Some(chunk) = artifact.new__next_chunk()? {
+                let mut chunk = chunk.to_vec(); // Здесь в любом случае Borrowed
 
                 for byte in chunk.iter_mut() {
                     *byte ^= key[key_pos];
@@ -27,7 +28,6 @@ impl Cipher for XorCipher {
                         key_pos = 0;
                     }
                 }
-
                 output.write_chunk(&chunk)?;
             }
 
@@ -37,10 +37,8 @@ impl Cipher for XorCipher {
             artifact.rewind_reading();
             let mut key_pos = 0;
 
-            loop {
-                let chunk: &mut [u8] = artifact.new__next_mut_chunk()?.expect("Можно менять данные только в оперативной памяти!");
-
-                if chunk.is_empty() { break }
+            while let Some(chunk) = artifact.new__next_chunk()? {
+                let chunk: &mut [u8] = unsafe { cow_borrowed_to_mut(chunk) };
 
                 for byte in chunk.iter_mut() {
                     *byte ^= key[key_pos];
@@ -66,5 +64,20 @@ impl Cipher for XorCipher {
 
     fn id(&self) -> CipherId {
         CipherId::Xor
+    }
+}
+
+
+// Первая небезопасная функция! Надеюсь, здесь не будет UB.
+// Если что, просто удалю эту функцию и буду копировать данные. :D
+/// Возвращает мутабельный срез на данные Cow, хотя безопасно этого сделать нельзя.
+unsafe fn cow_borrowed_to_mut(cow: Cow<'_, [u8]>) -> &mut [u8] {
+    match cow {
+        Cow::Borrowed(s) => {
+            let len = s.len();
+            let ptr = s.as_ptr() as *mut u8;
+            unsafe { slice::from_raw_parts_mut(ptr, len) }
+        }
+        Cow::Owned(_) => unreachable!(),
     }
 }
