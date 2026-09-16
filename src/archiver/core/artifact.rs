@@ -23,11 +23,12 @@ pub struct Artifact {
 }
 
 
-pub struct ArtifactAfterPipeline {
+#[derive(Debug, Clone)]
+pub struct ArchivedArtifactEntry {
     pub relative_path: String,
     pub original_size: u64,
     pub size_after_pipeline: u64,
-    pub payload: Artifact,
+    pub payload_offset: u64,
     pub pipeline: PipelineSettings,
     pub crc32: u32,
 }
@@ -99,6 +100,14 @@ impl Artifact {
         Ok(())
     }
 
+    pub fn write_to_file_end(&mut self, sink: &mut File) -> io::Result<()> {
+        while let Some(chunk) = self.new__next_chunk()? {
+            sink.write_all(&chunk)?;
+        }
+
+        Ok(())
+    }
+
     /// Возвращает кол-во хранящихся байт без учёта курсора чтения/записи.
     pub fn payload_size(&self) -> usize {
         match &self.state {
@@ -114,6 +123,10 @@ impl Artifact {
             ArtifactState::FileWindow { .. } => true,
             _ => false,
         }
+    }
+
+    pub fn get_file_path(&self) -> &Path {
+        self.file_path.as_path()
     }
 
     /// Если данные на диске, то будет возвращён None.
@@ -371,13 +384,6 @@ impl Drop for Artifact {
                 println!("The artifact [FILE WINDOW] has been dropped: {} bytes", len);
             }
         }
-    }
-}
-
-
-impl Clone for Artifact {
-    fn clone(&self) -> Artifact {
-        todo!()
     }
 }
 

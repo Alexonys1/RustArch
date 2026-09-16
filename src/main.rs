@@ -28,11 +28,11 @@ fn main() {
 
     let cli_command: CLICommand = match test_choice {
         TestCLICommand::Pack => CLICommand::Pack {
-            source_path: r"C:\Users\alex\Desktop\Предметы на следующий семестр".into(), // Важно, что эти относительные пути именно строки,
+            source_path: r"C:\Games\Battlefield 2142 Novgames RST".into(), // Важно, что эти относительные пути именно строки,
             target_archive_path: r".\test_data_for_removing\study.arch".into(), // которые можно менять
             settings: PipelineSettings {
                 compression: CompressionId::Huffman,
-                cipher: CipherId::Xor,
+                cipher: CipherId::NoCipher,
                 fec: FecId::NoFec,
             },
             encode_key: (1..=255).collect(), // Подбирать 255-БАЙТНЫЙ ключ полным перебором - это увлекательное дело!

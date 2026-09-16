@@ -1,10 +1,19 @@
 use std::fs;
 use std::path::Path;
+use std::sync::mpsc::{Receiver, Sender, channel};
 
 use crate::error::AppError;
 use crate::algorithms::PipelineSettings;
-use crate::archiver::{ArtifactAfterPipeline, WalkedFile, WalkResult, ArchiveEntry};
-use crate::archiver::{assemble_archive, read_header_and_entries, unpack_entries_parallel, walk_directory_or_file, pack_files_parallel};
+use crate::archiver::{WalkedFile, WalkResult, ArchiveEntry, ArchivedArtifactEntry, Artifact};
+use crate::archiver::{
+    read_header_and_entries,
+    unpack_entries_parallel,
+    walk_directory_or_file,
+    pack_files_parallel,
+    write_empty_dirs,
+    write_archive_header,
+    create_thread_with_queue_writer,
+};
 
 
 pub fn run_pack(
@@ -23,22 +32,31 @@ pub fn run_pack(
         )));
     }
 
-    // TODO: Всё-таки лучше передавать настройки архивации явно через аргументы функций, чем через глобальную переменную.
-    // TODO: Так и для тестирования лучше...
-    //set_pipeline_settings_as_global(settings, encode_key);
+    fs::create_dir_all(
+        target_archive_path
+            .parent()
+            .expect("У целевого архива всегда есть родитель! Даже Some(\"\")"),
+    )?;
 
-    fs::create_dir_all(target_archive_path.parent().expect("У целевого архива всегда есть родитель! Даже Some(\"\")"))?;
-
-    // Получим все файлы и директории внутри source_path, если
-    // это папка; или файл, если это один файл:
     let walked_targets: WalkResult = walk_directory_or_file(&source_path)?;
     let target_files: Vec<WalkedFile> = walked_targets.files;
     let target_empty_dirs: Vec<String> = walked_targets.empty_dirs;
 
-    let cooked_artifacts: Vec<ArtifactAfterPipeline> = pack_files_parallel(target_files, settings, &encode_key)?;
+    let (sender, receiver): (
+        Sender<(ArchivedArtifactEntry, Artifact)>,
+        Receiver<(ArchivedArtifactEntry, Artifact)>
+    ) = channel();
 
-    // На этом моменте создастся файл архива, если нет никакой ошибки:
-    assemble_archive(target_archive_path, settings, cooked_artifacts, target_empty_dirs)?;
+    let handler_of_artifact_writer = create_thread_with_queue_writer(target_archive_path.to_path_buf(), receiver);
+    pack_files_parallel(target_files, settings, &encode_key, sender)?;
+
+    // Здесь мы ждём пока все артефакты не будут записаны в архив. Только после этого записываем заголовок:
+    let archived_files = handler_of_artifact_writer
+        .join()
+        .map_err(|_| AppError::Compression("Поток записи архива аварийно завершился!".into()))??;
+
+    write_empty_dirs(target_archive_path, target_empty_dirs)?;
+    write_archive_header(target_archive_path, archived_files)?;
 
     Ok(())
 }
@@ -60,12 +78,11 @@ pub fn run_unpack(
     }
 
     let mut archive_file = fs::File::open(source_path)?;
-    let (pipeline_settings, entries): (PipelineSettings, Vec<ArchiveEntry>) = read_header_and_entries(&mut archive_file)?;
-    drop(archive_file); // Дальше каждый поток откроет archive_path сам
+    let entries: Vec<ArchiveEntry> = read_header_and_entries(&mut archive_file)?;
+    drop(archive_file);
 
     fs::create_dir_all(target_unpack_path)?;
-
-    unpack_entries_parallel(entries, source_path, target_unpack_path, pipeline_settings, decode_key)?;
+    unpack_entries_parallel(entries, source_path, target_unpack_path, decode_key)?;
 
     Ok(())
 }

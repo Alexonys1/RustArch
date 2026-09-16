@@ -1,53 +1,29 @@
-//! Бинарный формат файла архива.
+//! Бинарный формат архива RustArch.
+//!
+//! Новый формат не требует перемещения payload'ов после их записи.
 //!
 //! ```text
-//! [0..16)                 заголовок (magic, version, pack_pipeline, entry_count, reserved)
-//! [16..X)                 entry_count записей переменной длины
-//! [X..конец файла)        payload файла #1 | payload файла #2 | ...
+//! [0 .. payload_end)       payload #1 | payload #2 | ... | payload #N
+//! [payload_end .. table)  таблица ArchiveEntry
+//! [table .. EOF)           фиксированный footer
 //! ```
-//! Все числа - little-endian.
 //!
-//! Заголовок (16 байт):
-//! ```text
-//! offset 0    size 4   magic          b"RARC"
-//! offset 4    size 2   version        u16 LE
-//! offset 6    size 1   compression_id u8   <- ОДИН на весь архив
-//! offset 7    size 1   cipher_id      u8   <- ОДИН на весь архив
-//! offset 8    size 1   fec_id         u8   <- ОДИН на весь архив
-//! offset 9    size 1   flags          зарезервировано, сейчас 0
-//! offset 10   size 4   entry_count    u32 LE
-//! offset 14   size 2   reserved
-//! ```
-//! Единый пайплайн на архив позволяет
-//! распаковывать записи полностью параллельно и независимо друг от
-//! друга, читая пайплайн один раз из заголовка ДО запуска потоков,
-//! а не заново для каждой записи.
-//!
-//! Запись (переменная длина: 2 + path_len + 29 байт):
-//! ```text
-//! offset 0                size 2            path_len          u16 LE
-//! offset 2                size path_len     relative_path     UTF-8, '/'-разделитель
-//! offset +path_len        size 8            original_size     u64 LE
-//! offset +8               size 8            stored_size       u64 LE
-//! offset +8               size 8            payload_offset    u64 LE, абсолютное смещение в архиве
-//! offset +8               size 1            entry_flags       бит 0 = IS_DIRECTORY
-//! offset +1               size 4            crc32             u32 LE, от ИСХОДНЫХ данных
-//! ```
-//! Своя частотная таблица Huffman/окно LZ77 (если применимо) - это уже
-//! формат самого потока payload'а конкретного алгоритма, а не формата
-//! архива: архив видит payload как непрозрачные `stored_size` байт.
+//! Все числа little-endian.
 
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, Write, SeekFrom};
 
+use crate::algorithms::{CipherId, CompressionId, FecId, PipelineSettings};
 use crate::error::AppError;
-use crate::algorithms::{CipherId, CompressionId, FecId};
-use crate::algorithms::PipelineSettings;
 
 
 pub const MAGIC: [u8; 4] = *b"RARC";
-pub const FORMAT_VERSION: u16 = 1;
+pub const FORMAT_VERSION: u16 = 2;
 pub const ENTRY_FLAG_IS_DIRECTORY: u8 = 1 << 0;
+
+// Footer: magic(4) + version(2) + flags(2) + table_offset(8) +
+// entry_count(4) + table_size(8) + reserved(4) = 32 bytes.
+pub const FOOTER_SIZE: u64 = 32;
 
 
 #[derive(Debug, Clone)]
@@ -58,7 +34,9 @@ pub struct ArchiveEntry {
     pub payload_offset: u64,
     pub is_directory: bool,
     pub crc32: u32,
+    pub pipeline: PipelineSettings,
 }
+
 
 impl ArchiveEntry {
     fn entry_flags(&self) -> u8 {
@@ -67,16 +45,11 @@ impl ArchiveEntry {
 }
 
 
-pub fn write_header(file: &mut File, entry_count: u32, pipeline: PipelineSettings) -> Result<(), AppError> {
-    file.write_all(&MAGIC)?;
-    file.write_all(&FORMAT_VERSION.to_le_bytes())?;
-    file.write_all(&[pipeline.compression.as_u8()])?;
-    file.write_all(&[pipeline.cipher.as_u8()])?;
-    file.write_all(&[pipeline.fec.as_u8()])?;
-    file.write_all(&0u8.to_le_bytes())?; // flags, зарезервировано
-    file.write_all(&entry_count.to_le_bytes())?;
-    file.write_all(&0u16.to_le_bytes())?; // reserved
-    Ok(())
+#[derive(Debug, Clone, Copy)]
+pub struct ArchiveFooter {
+    pub table_offset: u64,
+    pub entry_count: u32,
+    pub table_size: u64,
 }
 
 
@@ -96,32 +69,92 @@ pub fn write_entry(file: &mut File, entry: &ArchiveEntry) -> Result<(), AppError
     file.write_all(&entry.payload_offset.to_le_bytes())?;
     file.write_all(&[entry.entry_flags()])?;
     file.write_all(&entry.crc32.to_le_bytes())?;
+    file.write_all(&[entry.pipeline.compression.as_u8()])?;
+    file.write_all(&[entry.pipeline.cipher.as_u8()])?;
+    file.write_all(&[entry.pipeline.fec.as_u8()])?;
+    file.write_all(&0u8.to_le_bytes())?;
     Ok(())
 }
 
 
-
 pub fn entry_size_bytes(relative_path: &str) -> u64 {
-    2 + relative_path.as_bytes().len() as u64 + 8 + 8 + 8 + 1 + 4
+    // path_len + path + original_size + stored_size + payload_offset +
+    // flags + crc32 + compression + cipher + fec + reserved.
+    2 + relative_path.as_bytes().len() as u64 + 8 + 8 + 8 + 1 + 4 + 1 + 1 + 1 + 1
 }
 
 
-fn read_exact_vec(file: &mut File, len: usize) -> std::io::Result<Vec<u8>> {
+fn read_exact_vec(file: &mut File, len: usize) -> Result<Vec<u8>, AppError> {
     let mut buf = vec![0u8; len];
     file.read_exact(&mut buf)?;
     Ok(buf)
 }
 
 
-pub fn read_header_and_entries(file: &mut File) -> Result<(PipelineSettings, Vec<ArchiveEntry>), AppError> {
-    file.seek(SeekFrom::Start(0))?;
+fn read_one_entry(file: &mut File) -> Result<ArchiveEntry, AppError> {
+    let mut u16_buf = [0u8; 2];
+    file.read_exact(&mut u16_buf)?;
+    let path_len = u16::from_le_bytes(u16_buf) as usize;
+
+    let path_bytes = read_exact_vec(file, path_len)?;
+    let relative_path = String::from_utf8(path_bytes)
+        .map_err(|_| AppError::CorruptArchive("Путь записи не является валидным UTF-8".into()))?;
+
+    let mut u64_buf = [0u8; 8];
+    file.read_exact(&mut u64_buf)?;
+    let original_size = u64::from_le_bytes(u64_buf);
+    file.read_exact(&mut u64_buf)?;
+    let stored_size = u64::from_le_bytes(u64_buf);
+    file.read_exact(&mut u64_buf)?;
+    let payload_offset = u64::from_le_bytes(u64_buf);
+
+    let mut u8_buf = [0u8; 1];
+    file.read_exact(&mut u8_buf)?;
+    let entry_flags = u8_buf[0];
+    if entry_flags & !ENTRY_FLAG_IS_DIRECTORY != 0 {
+        return Err(AppError::CorruptArchive(format!(
+            "Неизвестные флаги записи '{}': {entry_flags:#x}",
+            relative_path
+        )));
+    }
+    let is_directory = entry_flags & ENTRY_FLAG_IS_DIRECTORY != 0;
+
+    let mut u32_buf = [0u8; 4];
+    file.read_exact(&mut u32_buf)?;
+    let crc32 = u32::from_le_bytes(u32_buf);
+
+    file.read_exact(&mut u8_buf)?;
+    let compression = CompressionId::from_u8(u8_buf[0])?;
+    file.read_exact(&mut u8_buf)?;
+    let cipher = CipherId::from_u8(u8_buf[0])?;
+    file.read_exact(&mut u8_buf)?;
+    let fec = FecId::from_u8(u8_buf[0])?;
+    file.read_exact(&mut u8_buf)?; // reserved
+
+    Ok(ArchiveEntry {
+        relative_path,
+        original_size,
+        stored_size,
+        payload_offset,
+        is_directory,
+        crc32,
+        pipeline: PipelineSettings { compression, cipher, fec },
+    })
+}
+
+
+pub fn read_footer(file: &mut File) -> Result<ArchiveFooter, AppError> {
+    let file_len = file.metadata()?.len();
+    if file_len < FOOTER_SIZE {
+        return Err(AppError::CorruptArchive("Архив слишком короткий для footer".into()));
+    }
+
+    file.seek(SeekFrom::Start(file_len - FOOTER_SIZE))?;
 
     let mut magic = [0u8; 4];
     file.read_exact(&mut magic)?;
     if magic != MAGIC {
-        return Err(AppError::CorruptArchive(
-            "Неверная сигнатура файла - это не архив данного формата".to_string(),
-        ));
+        return Err(AppError::CorruptArchive("Неверная сигнатура footer архива".into()));
     }
 
     let mut u16_buf = [0u8; 2];
@@ -133,66 +166,134 @@ pub fn read_header_and_entries(file: &mut File) -> Result<(PipelineSettings, Vec
         )));
     }
 
-    let mut u8_buf = [0u8; 1];
-    file.read_exact(&mut u8_buf)?;
-    let compression = CompressionId::from_u8(u8_buf[0])?;
-    file.read_exact(&mut u8_buf)?;
-    let cipher = CipherId::from_u8(u8_buf[0])?;
-    file.read_exact(&mut u8_buf)?;
-    let fec = FecId::from_u8(u8_buf[0])?;
-    file.read_exact(&mut u8_buf)?; // flags, пока игнорируем
+    file.read_exact(&mut u16_buf)?; // flags
+
+    let mut u64_buf = [0u8; 8];
+    file.read_exact(&mut u64_buf)?;
+    let table_offset = u64::from_le_bytes(u64_buf);
 
     let mut u32_buf = [0u8; 4];
     file.read_exact(&mut u32_buf)?;
     let entry_count = u32::from_le_bytes(u32_buf);
 
-    file.read_exact(&mut u16_buf)?; // reserved
+    file.read_exact(&mut u64_buf)?;
+    let table_size = u64::from_le_bytes(u64_buf);
 
-    let pipeline = PipelineSettings { compression, cipher, fec };
+    let mut reserved = [0u8; 4];
+    file.read_exact(&mut reserved)?;
 
-    let mut entries = Vec::with_capacity(entry_count as usize);
-    for _ in 0..entry_count {
-        entries.push(read_one_entry(file)?);
+    if table_offset.checked_add(table_size).is_none()
+        || table_offset + table_size != file_len - FOOTER_SIZE
+    {
+        return Err(AppError::CorruptArchive("Некорректные границы таблицы архива".into()));
     }
 
-    Ok((pipeline, entries))
+    Ok(ArchiveFooter { table_offset, entry_count, table_size })
 }
 
 
-fn read_one_entry(file: &mut File) -> Result<ArchiveEntry, AppError> {
-    let mut u16_buf = [0u8; 2];
-    file.read_exact(&mut u16_buf)?;
-    let path_len = u16::from_le_bytes(u16_buf) as usize;
+pub fn read_entries_in_range(
+    file: &mut File,
+    start: u64,
+    end: u64,
+) -> Result<Vec<ArchiveEntry>, AppError> {
+    if end < start {
+        return Err(AppError::CorruptArchive("Некорректный диапазон таблицы".into()));
+    }
 
-    let path_bytes = read_exact_vec(file, path_len)?;
-    let relative_path = String::from_utf8(path_bytes)
-        .map_err(|_| AppError::CorruptArchive("Путь записи не является валидным UTF-8".to_string()))?;
+    file.seek(SeekFrom::Start(start))?;
+    let mut entries = Vec::new();
+    while file.stream_position()? < end {
+        let before = file.stream_position()?;
+        entries.push(read_one_entry(file)?);
+        let after = file.stream_position()?;
+        if after <= before || after > end {
+            return Err(AppError::CorruptArchive("Повреждённая запись таблицы".into()));
+        }
+    }
+    if file.stream_position()? != end {
+        return Err(AppError::CorruptArchive("Таблица не выровнена по границе записи".into()));
+    }
+    Ok(entries)
+}
 
-    let mut u64_buf = [0u8; 8];
-    file.read_exact(&mut u64_buf)?;
-    let original_size = u64::from_le_bytes(u64_buf);
 
-    file.read_exact(&mut u64_buf)?;
-    let stored_size = u64::from_le_bytes(u64_buf);
+pub fn read_header_and_entries(file: &mut File) -> Result<Vec<ArchiveEntry>, AppError> {
+    let footer = read_footer(file)?;
 
-    file.read_exact(&mut u64_buf)?;
-    let payload_offset = u64::from_le_bytes(u64_buf);
+    file.seek(SeekFrom::Start(footer.table_offset))?;
+    let table_end = footer.table_offset + footer.table_size;
+    let mut entries = Vec::with_capacity(footer.entry_count as usize);
 
-    let mut u8_buf = [0u8; 1];
-    file.read_exact(&mut u8_buf)?;
-    let entry_flags = u8_buf[0];
-    let is_directory = entry_flags & ENTRY_FLAG_IS_DIRECTORY != 0;
+    for _ in 0..footer.entry_count {
+        let before = file.stream_position()?;
+        entries.push(read_one_entry(file)?);
+        let after = file.stream_position()?;
+        if after > table_end {
+            return Err(AppError::CorruptArchive("Запись выходит за пределы таблицы".into()));
+        }
+        if after <= before {
+            return Err(AppError::CorruptArchive("Некорректный размер записи".into()));
+        }
+    }
 
-    let mut u32_buf = [0u8; 4];
-    file.read_exact(&mut u32_buf)?;
-    let crc32 = u32::from_le_bytes(u32_buf);
+    if file.stream_position()? != table_end {
+        return Err(AppError::CorruptArchive("Размер таблицы не совпадает с её записями".into()));
+    }
 
-    Ok(ArchiveEntry {
-        relative_path,
-        original_size,
-        stored_size,
-        payload_offset,
-        is_directory,
-        crc32,
-    })
+    let mut payload_ranges: Vec<(u64, u64)> = Vec::new();
+
+    for entry in &entries {
+        if entry.is_directory {
+            if entry.stored_size != 0 || entry.payload_offset != 0 || entry.original_size != 0 {
+                return Err(AppError::CorruptArchive(format!(
+                    "Некорректная запись директории '{}'",
+                    entry.relative_path
+                )));
+            }
+        } else {
+            let end = entry.payload_offset.checked_add(entry.stored_size)
+                .ok_or_else(|| AppError::CorruptArchive(format!(
+                    "Переполнение payload диапазона '{}'",
+                    entry.relative_path
+                )))?;
+            if end > footer.table_offset {
+                return Err(AppError::CorruptArchive(format!(
+                    "Payload '{}' выходит за пределы payload-секции",
+                    entry.relative_path
+                )));
+            }
+            payload_ranges.push((entry.payload_offset, end));
+        }
+    }
+
+    payload_ranges.sort_unstable_by_key(|&(start, end)| (start, end));
+    let mut expected = 0u64;
+    for (start, end) in payload_ranges {
+        if start != expected {
+            return Err(AppError::CorruptArchive(
+                "Payload'ы не образуют непрерывную непересекающуюся секцию".into(),
+            ));
+        }
+        expected = end;
+    }
+    if expected != footer.table_offset {
+        return Err(AppError::CorruptArchive(
+            "Конец payload-секции не совпадает с table_offset".into(),
+        ));
+    }
+
+    Ok(entries)
+}
+
+
+pub fn write_footer(file: &mut File, footer: ArchiveFooter) -> Result<(), AppError> {
+    file.write_all(&MAGIC)?;
+    file.write_all(&FORMAT_VERSION.to_le_bytes())?;
+    file.write_all(&0u16.to_le_bytes())?;
+    file.write_all(&footer.table_offset.to_le_bytes())?;
+    file.write_all(&footer.entry_count.to_le_bytes())?;
+    file.write_all(&footer.table_size.to_le_bytes())?;
+    file.write_all(&0u32.to_le_bytes())?;
+    Ok(())
 }
