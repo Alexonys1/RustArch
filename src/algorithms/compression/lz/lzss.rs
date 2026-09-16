@@ -110,7 +110,7 @@ impl Compressor for LzssCompressor {
             )));
         }
 
-        let original_size = artifact.payload_size() as u64;
+        let original_size = artifact.get_payload_size() as u64;
         let mut output = Artifact::new_with_temp_file_suffix(&artifact, "compressed");
         output.write_chunk(&original_size.to_le_bytes())?;
 

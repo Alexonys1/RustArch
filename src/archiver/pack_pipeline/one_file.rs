@@ -5,7 +5,7 @@ use crate::algorithms::{Cipher, ErrorCorrectionCode, PipelineSettings, Compressi
 use crate::archiver::{crc32_of_artifact_and_rewind, Artifact, WalkedFile, ArchivedArtifactEntry};
 use crate::error::AppError;
 
-const IS_OPTIMIZE_ON: bool = false; // TODO:  Исправить баг!!!
+const IS_OPTIMIZE_ON: bool = true; // TODO:  Исправить баг!!!
 
 
 /// compress -> encrypt -> fec-encode
@@ -20,7 +20,7 @@ pub fn pack_file(
 {
     let mut artifact = Artifact::from_file(file.absolute_path.as_ref())?;
 
-    let original_size = artifact.payload_size() as u64;
+    let original_size = artifact.get_payload_size() as u64;
     let crc32 = crc32_of_artifact_and_rewind(&mut artifact, pipeline_settings)?;
 
     let cipher: Box<dyn Cipher> = pipeline_settings.cipher.get();
@@ -35,7 +35,7 @@ pub fn pack_file(
     let encoded_artifact = cipher.transform(compressed_artifact, encode_key)?;
     let cooked_artifact = fec.encode(encoded_artifact)?;
 
-    let size_after_pipeline = cooked_artifact.payload_size() as u64;
+    let size_after_pipeline = cooked_artifact.get_payload_size() as u64;
     let entry = ArchivedArtifactEntry {
         relative_path: file.relative_path.clone(),
         original_size,
@@ -68,18 +68,25 @@ fn compress_with_fallback(
         return Ok((artifact, original_compressor_id));
     }
 
+    let artifact_payload_size = artifact.get_payload_size();
+
     let compressor = original_compressor_id.get();
     let compressed_artifact = compressor.compress(artifact)?;
 
-    if (compressed_artifact.payload_size() as u64) < original_size || !IS_OPTIMIZE_ON {
+    if (compressed_artifact.get_payload_size() as u64) < original_size || !IS_OPTIMIZE_ON {
         Ok((compressed_artifact, original_compressor_id))
-    } else {
+    }
+    else {
         drop(compressed_artifact);
+
         let raw_artifact = Artifact::from_file(original_path)
             .map_err(|e| AppError::Compression(format!(
                 "compress_with_fallback: Не удалось повторно открыть '{}' для отката на NoCompressor: {e}",
                 original_path.display()
             )))?;
+
+        //println!("path: {}, payload: {}", raw_artifact.get_file_path().display(), raw_artifact.get_payload_size());
+
         Ok((raw_artifact, CompressionId::NoCompression))
     }
 }

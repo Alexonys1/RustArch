@@ -80,34 +80,53 @@ pub fn write_archive_header(
         }
     }
 
-    // Проверяем, что offsets действительно принадлежат payload-секции и не
-    // пересекаются. Writer записывает их последовательно, но проверка здесь
-    // защищает формат от повреждённой/неполной финализации.
-    let mut ranges: Vec<(u64, u64)> = Vec::with_capacity(archived_files.len());
+    let mut ranges: Vec<(u64, u64, String)> =
+        Vec::with_capacity(archived_files.len());
+
     for entry in &archived_files {
-        let end = entry.payload_offset.checked_add(entry.size_after_pipeline)
+        let start = entry.payload_offset;
+
+        let end = start.checked_add(entry.size_after_pipeline)
             .ok_or_else(|| AppError::CorruptArchive(format!(
                 "Переполнение payload диапазона '{}'",
                 entry.relative_path
             )))?;
+
         if end > payload_end {
             return Err(AppError::CorruptArchive(format!(
                 "Payload '{}' выходит за границы payload-секции",
                 entry.relative_path
             )));
         }
-        ranges.push((entry.payload_offset, end));
+
+        // Пустой файл не занимает места и не должен участвовать
+        // в проверке непрерывного покрытия payload-секции.
+        if start == end {
+            continue;
+        }
+
+        ranges.push((start, end, entry.relative_path.clone()));
     }
-    ranges.sort_unstable_by_key(|&(start, _)| start);
+
+    ranges.sort_unstable_by_key(|&(start, _, _)| start);
+
     let mut expected = 0u64;
-    for (start, end) in ranges {
+
+    for (start, end, path) in ranges {
         if start != expected {
+            println!(
+                "start={}, end={}, expected={}, path={}",
+                start, end, expected, path
+            );
+
             return Err(AppError::CorruptArchive(
                 "Payload'ы не образуют непрерывную секцию архива".into(),
             ));
         }
+
         expected = end;
     }
+
     if expected != payload_end {
         return Err(AppError::CorruptArchive(
             "Фактическая сумма payload'ов не совпадает с их offsets".into(),

@@ -55,10 +55,10 @@ impl Compressor for Lz77Compressor {
             )));
         }
 
-        // payload_size() - это метаданные (просто число), а не чтение
+        // get_payload_size() - это метаданные (просто число), а не чтение
         // содержимого, поэтому узнать общий размер заранее можно без
         // единого обращения к самим данным файла.
-        let n = artifact.payload_size() as u64;
+        let n = artifact.get_payload_size() as u64;
         let mut output = Artifact::new_with_temp_file_suffix(&artifact, "compressed");
         output.write_chunk(&n.to_le_bytes())?;
 
