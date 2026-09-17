@@ -392,17 +392,19 @@ impl Drop for Artifact {
                 if self.is_temp_file {
                     let path: &Path = self.file_path.as_ref();
                     let result: io::Result<()> = fs::remove_file(path);
-                    //println!("The artifact [FILE] has been removed: {:?}. Path: {:?}", result, self.file_path);
+                    println!("The artifact [FILE] has been removed: {:?}. Path: {:?}", result, self.file_path);
                 } else {
-                    //println!("The artifact [FILE] has been dropped, but the file is still exists. Path: {:?}", self.file_path);
+                    println!("The artifact [FILE] has been dropped, but the file is still exists. Path: {:?}", self.file_path);
                 }
             }
+
             ArtifactState::Memory { data, .. } => {
-                //println!("The artifact [MEMORY]  has been dropped: {} bytes", data.len());
+                println!("The artifact [MEMORY]  has been dropped: {} bytes", data.len());
                 //super::memory_budget::show_memory_bar();
             }
+
             ArtifactState::FileWindow { len, .. } => {
-                //println!("The artifact [FILE WINDOW] has been dropped: {} bytes", len);
+                println!("The artifact [FILE WINDOW] has been dropped: {} bytes", len);
             }
         }
     }

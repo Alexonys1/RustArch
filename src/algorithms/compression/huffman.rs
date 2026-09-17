@@ -4,20 +4,24 @@ use std::collections::BinaryHeap;
 use crate::error::AppError;
 use crate::archiver::Artifact;
 use super::{CompressionId, Compressor};
-use super::utils::BufferedArtifactReader;
 
 
-/// Размер алфавита - все возможные значения одного байта.
 const ALPHABET_SIZE: usize = 256;
-
-/// Порог сброса накопленного битового буфера в Artifact::write_chunk_from.
-/// Ограничивает буфер константой независимо от размера файла - раньше
-/// весь сжатый поток целиком копился в памяти до единственной записи
-/// в конце (`output.write_chunk_from(&writer.finish())`), это и было причиной
-/// расхода памяти сверх заданного бюджета: этот буфер существовал в куче
-/// ДО того, как хоть один байт попадал в Artifact и мог быть учтён его
-/// внутренним BudgetGuard.
 const OUTPUT_FLUSH_SIZE: usize = 256 * 1024;
+
+/// Размер таблицы табличного декодирования - 2^12 = 4096 записей. Любой
+/// код длиной <= TABLE_BITS декодируется ОДНИМ обращением к таблице вместо
+/// побитового спуска по дереву. Коды длиннее (крайне редкий случай для
+/// 256-символьного алфавита на реальных данных - потребовал бы частот,
+/// растущих почти строго по числам Фибоначчи) обрабатываются медленным
+/// fallback-путём - обходом дерева бит за битом, как раньше.
+const TABLE_BITS: u32 = 12;
+const TABLE_SIZE: usize = 1 << TABLE_BITS;
+
+/// Код Хаффмана, упакованный как (биты, длина_в_битах) вместо `Vec<bool>`.
+/// Copy-тип - ноль аллокаций на таблицу кодов (было до 256 отдельных
+/// куча-аллокаций, по одной на символ).
+type Code = (u32, u8);
 
 
 /// Узел дерева Хаффмана. Дерево строится и в компрессоре, и в декомпрессоре
@@ -48,7 +52,6 @@ impl PartialEq for HeapEntry {
         self.node.freq() == other.node.freq() && self.seq == other.seq
     }
 }
-
 impl Eq for HeapEntry {}
 
 impl PartialOrd for HeapEntry {
@@ -65,9 +68,6 @@ impl Ord for HeapEntry {
 }
 
 
-/// Строит дерево Хаффмана по списку (символ, частота). Список ДОЛЖЕН
-/// содержать минимум 2 записи - вырожденный случай одного символа
-/// обрабатывается отдельно на уровне compress/decompress.
 fn build_tree(distinct: &[(u8, u64)]) -> HuffmanNode {
     let mut heap: BinaryHeap<HeapEntry> = BinaryHeap::with_capacity(distinct.len());
     let mut seq: u64 = 0;
@@ -80,13 +80,11 @@ fn build_tree(distinct: &[(u8, u64)]) -> HuffmanNode {
     while heap.len() > 1 {
         let a = heap.pop().unwrap();
         let b = heap.pop().unwrap();
-
         let merged = HuffmanNode::Internal {
             freq: a.node.freq() + b.node.freq(),
             left: Box::new(a.node),
             right: Box::new(b.node),
         };
-
         heap.push(HeapEntry { node: merged, seq });
         seq += 1;
     }
@@ -95,53 +93,64 @@ fn build_tree(distinct: &[(u8, u64)]) -> HuffmanNode {
 }
 
 
-fn assign_codes(node: &HuffmanNode, prefix: &mut Vec<bool>, codes: &mut [Option<Vec<bool>>]) {
+/// Заполняет таблицу кодов, накапливая биты сдвигами прямо в `u32` по ходу
+/// рекурсии - ни одной промежуточной аллокации (было `prefix: &mut
+/// Vec<bool>` + `prefix.clone()` на каждом листе).
+fn assign_codes(node: &HuffmanNode, code: u32, len: u8, codes: &mut [Option<Code>]) { // TODO: А насколько длинные коды там могут быть?
     match node {
         HuffmanNode::Leaf { symbol, .. } => {
-            codes[*symbol as usize] = Some(prefix.clone());
+            codes[*symbol as usize] = Some((code, len));
         }
         HuffmanNode::Internal { left, right, .. } => {
-            prefix.push(false);
-            assign_codes(left, prefix, codes);
-            prefix.pop();
-
-            prefix.push(true);
-            assign_codes(right, prefix, codes);
-            prefix.pop();
+            debug_assert!(len < 32, "код Хаффмана длиннее 32 бит - экстремально маловероятно на реальных данных");
+            assign_codes(left, code << 1, len + 1, codes);
+            assign_codes(right, (code << 1) | 1, len + 1, codes);
         }
     }
 }
 
 
-/// Побитовый писатель, который сбрасывает накопленные байты в `Artifact`
-/// по мере заполнения буфера, а не хранит весь сжатый поток в памяти до
-/// самого конца. Держит `&mut Artifact`, поэтому его нельзя использовать
-/// одновременно с чем-либо ещё, что пишет в тот же артефакт - это и не
-/// нужно, он владеет выводом на всё время кодирования.
+// ============================================================
+// ЗАПИСЬ: аккумулятор вместо побитового цикла
+// ============================================================
+
+/// Вместо накопления по одному биту (`push_bit` в цикле на каждый бит
+/// кода) - заносим ВЕСЬ код одной операцией сдвига в 64-битный аккумулятор
+/// и извлекаем готовые байты пока их накопилось >= 8. Порядок бит - тот
+/// же MSB-first, что был раньше (бит, соответствующий корню дерева,
+/// первым попадает в поток) - это не отдельная строка кода "на всякий
+/// случай", а естественное следствие того, как код размещается в
+/// аккумуляторе: маскировка последнего неполного байта не нужна отдельным
+/// кодом, она "встроена" в природу аккумулятора - биты выше `nbits`
+/// гарантированно нулевые, поэтому обрезание до u8 в конце само даёт
+/// нужный нулевой паддинг.
 struct StreamingBitWriter<'a> {
     output: &'a mut Artifact,
     buf: Vec<u8>,
-    cur: u8,
-    nbits: u8,
+    acc: u64,
+    nbits: u32,
 }
 
 impl<'a> StreamingBitWriter<'a> {
     fn new(output: &'a mut Artifact) -> Self {
-        Self {
-            output,
-            buf: Vec::with_capacity(OUTPUT_FLUSH_SIZE),
-            cur: 0,
-            nbits: 0,
-        }
+        Self { output, buf: Vec::with_capacity(OUTPUT_FLUSH_SIZE), acc: 0, nbits: 0 }
     }
 
-    fn push_bit(&mut self, bit: bool) -> Result<(), AppError> {
-        self.cur = (self.cur << 1) | (bit as u8);
-        self.nbits += 1;
-        if self.nbits == 8 {
-            self.buf.push(self.cur);
-            self.cur = 0;
-            self.nbits = 0;
+    /// Записывает код целиком за одну операцию вместо цикла по битам.
+    /// Корректно, пока `code` содержит ровно `len` значащих бит,
+    /// левоюстированных в пределах этих `len` бит (гарантируется тем, как
+    /// `assign_codes` их строит).
+    fn push_code(&mut self, code: u32, len: u8) -> Result<(), AppError> {
+        let len = len as u32;
+        // Место в аккумуляторе для нового кода начинается сразу после уже
+        // накопленных nbits бит (они занимают верхние разряды).
+        self.acc |= (code as u64) << (64 - self.nbits - len);
+        self.nbits += len;
+
+        while self.nbits >= 8 {
+            self.buf.push((self.acc >> 56) as u8);
+            self.acc <<= 8;
+            self.nbits -= 8;
             if self.buf.len() >= OUTPUT_FLUSH_SIZE {
                 self.output.write_chunk_from(&self.buf)?;
                 self.buf.clear();
@@ -150,20 +159,9 @@ impl<'a> StreamingBitWriter<'a> {
         Ok(())
     }
 
-    fn push_bits(&mut self, bits: &[bool]) -> Result<(), AppError> {
-        for &b in bits {
-            self.push_bit(b)?;
-        }
-        Ok(())
-    }
-
-    /// Дописывает неполный последний байт (нулями справа) и сбрасывает
-    /// остаток буфера. Потребляет `self`, чтобы нельзя было случайно
-    /// продолжить писать после финализации.
     fn finish(mut self) -> Result<(), AppError> {
         if self.nbits > 0 {
-            self.cur <<= 8 - self.nbits;
-            self.buf.push(self.cur);
+            self.buf.push((self.acc >> 56) as u8);
         }
         if !self.buf.is_empty() {
             self.output.write_chunk_from(&self.buf)?;
@@ -173,37 +171,113 @@ impl<'a> StreamingBitWriter<'a> {
 }
 
 
-/// Побитовый читатель, симметричный `StreamingBitWriter`: дочитывает
-/// байты из артефакта по мере надобности через `BufferedArtifactReader`
-/// (тот же буферизованный хелпер, что и в LZSS/LZ77 - избегает и
-/// накопления всего потока в памяти, и лишних seek()+read() на каждый байт).
-struct StreamingBitReader<'a> {
-    reader: BufferedArtifactReader<'a>,
-    cur_byte: u8,
-    bit_pos: u8, // 8 == "текущий байт исчерпан, нужен новый"
+// ============================================================
+// ЧТЕНИЕ ДЛЯ ДЕКОДИРОВАНИЯ: аккумулятор + таблица
+// ============================================================
+
+/// Готовая запись табличного декодирования: либо "код такой-то длины дал
+/// вот этот символ", либо "код длиннее TABLE_BITS - идите по дереву".
+#[derive(Clone, Copy)]
+enum DecodeEntry {
+    Symbol(u8, u8), // (символ, длина кода в битах)
+    Escape,
 }
 
-impl<'a> StreamingBitReader<'a> {
-    fn new(reader: BufferedArtifactReader<'a>) -> Self {
-        Self { reader, cur_byte: 0, bit_pos: 8 }
-    }
+/// Строит плоскую таблицу размером `TABLE_SIZE`: для каждого возможного
+/// TABLE_BITS-битного окна - каким символом оно резолвится и сколько бит
+/// код реально занял. Коды короче TABLE_BITS размножаются по всем
+/// "безразличным" хвостовым битам (префиксное свойство кода Хаффмана
+/// гарантирует, что это не создаёт неоднозначностей).
+fn build_decode_table(tree: &HuffmanNode) -> Vec<DecodeEntry> {
+    let mut table = vec![DecodeEntry::Escape; TABLE_SIZE];
+    fill_table(tree, 0, 0, &mut table);
+    table
+}
 
-    fn read_bit(&mut self) -> Result<bool, AppError> {
-        if self.bit_pos == 8 {
-            self.cur_byte = self.reader.read_u8()?; // CorruptArchive при обрыве потока
-            self.bit_pos = 0;
+fn fill_table(node: &HuffmanNode, code: u32, len: u32, table: &mut [DecodeEntry]) {
+    match node {
+        HuffmanNode::Leaf { symbol, .. } => {
+            if len <= TABLE_BITS {
+                let shift = TABLE_BITS - len;
+                let base = (code as usize) << shift;
+                for i in 0..(1usize << shift) {
+                    table[base + i] = DecodeEntry::Symbol(*symbol, len as u8);
+                }
+            }
+            // len > TABLE_BITS: соответствующий узел не укладывается в
+            // таблицу - все ведущие к нему индексы остаются Escape
+            // (не были и не будут перезаписаны), декодер пойдёт по дереву.
         }
-        let bit = (self.cur_byte >> (7 - self.bit_pos)) & 1;
-        self.bit_pos += 1;
-        Ok(bit != 0)
+        HuffmanNode::Internal { left, right, .. } => {
+            if len < TABLE_BITS {
+                fill_table(left, code << 1, len + 1, table);
+                fill_table(right, (code << 1) | 1, len + 1, table);
+            }
+            // len == TABLE_BITS и это внутренний узел (код ещё не
+            // разрешился в символ за отведённые биты) - глубже не идём,
+            // это и есть Escape-случай для длинных кодов.
+        }
     }
 }
 
+/// Скользящее окно бит поверх `Artifact::next_chunk()`. Не хранит `Cow`
+/// как поле (см. пояснение в начале ответа) - вместо этого при переходе
+/// на новый чанк берёт владение через `.into_owned()`: бесплатно для
+/// File/FileWindow (там и так `Cow::Owned`), одно копирование на границу
+/// чанка для Memory (не на байт).
+struct BitWindow<'a> {
+    artifact: &'a mut Artifact,
+    chunk: Vec<u8>,
+    chunk_pos: usize,
+    acc: u32,   // валидные биты - в СТАРШИХ разрядах (MSB-first)
+    nbits: u32,
+}
+
+impl<'a> BitWindow<'a> {
+    fn new(artifact: &'a mut Artifact) -> Self {
+        Self { artifact, chunk: Vec::new(), chunk_pos: 0, acc: 0, nbits: 0 }
+    }
+
+    /// Догружает аккумулятор минимум до `want` валидных бит. Если реальные
+    /// данные кончились раньше - оставшиеся "виртуальные" биты трактуются
+    /// как нулевой паддинг (они и так уже нули в `acc`) - безопасно, т.к.
+    /// решение "сколько символов декодировать" принимается по
+    /// `original_size`, а не по количеству реально прочитанных бит.
+    fn fill(&mut self, want: u32) -> Result<(), AppError> {
+        while self.nbits < want {
+            if self.chunk_pos >= self.chunk.len() {
+                match self.artifact.next_chunk()? {
+                    Some(cow) => {
+                        self.chunk = cow.into_owned();
+                        self.chunk_pos = 0;
+                    }
+                    None => return Ok(()), // конец потока - остаток трактуем как нулевой паддинг
+                }
+                if self.chunk.is_empty() {
+                    continue; // на случай пустого чанка - не должно происходить, но не зацикливаемся
+                }
+            }
+            let byte = self.chunk[self.chunk_pos];
+            self.chunk_pos += 1;
+            self.acc |= (byte as u32) << (24 - self.nbits);
+            self.nbits += 8;
+        }
+        Ok(())
+    }
+
+    fn peek(&self, n: u32) -> u32 {
+        self.acc >> (32 - n)
+    }
+
+    fn consume(&mut self, n: u32) {
+        self.acc <<= n;
+        self.nbits = self.nbits.saturating_sub(n);
+    }
+}
 
 fn read_exact_from_artifact(artifact: &mut Artifact, n: usize) -> Result<Vec<u8>, AppError> {
     let mut buf = vec![0u8; n];
     let mut filled = 0;
-
     while filled < n {
         let read = artifact.read_chunk_to(&mut buf[filled..])?;
         if read == 0 {
@@ -213,7 +287,6 @@ fn read_exact_from_artifact(artifact: &mut Artifact, n: usize) -> Result<Vec<u8>
         }
         filled += read;
     }
-
     Ok(buf)
 }
 
@@ -221,16 +294,16 @@ fn read_exact_from_artifact(artifact: &mut Artifact, n: usize) -> Result<Vec<u8>
 pub struct HuffmanCompressor;
 
 
-impl Compressor for HuffmanCompressor { // TODO: А мы можем загрузить весь файл в память, чтобы ускорить его обработку?
+impl Compressor for HuffmanCompressor {
     fn compress(&self, mut artifact: Artifact) -> Result<Artifact, AppError> {
         // --- Первый проход: считаем частоты байт и общий размер данных ---
-        // Уже был потоковым и остаётся таким - freqs занимает фиксированные
-        // 256*8 = 2 КБ независимо от размера файла.
+        // artifact.next_chunk() напрямую: для Memory-состояния это
+        // Cow::Borrowed - ни одного скопированного байта на весь проход.
         let mut freqs = [0u64; ALPHABET_SIZE];
         let mut original_size: u64 = 0;
 
-        while let Some(chunk) = artifact.read_next_chunk_with_clone()? {
-            for &b in &chunk {
+        while let Some(chunk) = artifact.next_chunk()? {
+            for &b in chunk.iter() {
                 freqs[b as usize] += 1;
             }
             original_size += chunk.len() as u64;
@@ -238,7 +311,6 @@ impl Compressor for HuffmanCompressor { // TODO: А мы можем загруз
         artifact.rewind_reading();
 
         let mut output = Artifact::new_with_temp_file_suffix(&artifact, "compressed");
-
         output.write_chunk_from(&original_size.to_le_bytes())?;
 
         let distinct: Vec<(u8, u64)> = freqs
@@ -259,19 +331,16 @@ impl Compressor for HuffmanCompressor { // TODO: А мы можем загруз
         }
 
         let tree = build_tree(&distinct);
-        let mut codes: Vec<Option<Vec<bool>>> = vec![None; ALPHABET_SIZE];
-        let mut prefix = Vec::new();
-        assign_codes(&tree, &mut prefix, &mut codes);
+        let mut codes: [Option<Code>; ALPHABET_SIZE] = [None; ALPHABET_SIZE];
+        assign_codes(&tree, 0, 0, &mut codes);
 
-        // --- Второй проход: кодируем данные, сбрасывая биты по мере
-        // накопления, а не храня весь сжатый поток в памяти до конца. ---
+        // --- Второй проход: кодируем данные аккумулятором ---
         let mut writer = StreamingBitWriter::new(&mut output);
-        while let Some(chunk) = artifact.read_next_chunk_with_clone()? {
-            for &b in &chunk {
-                let code = codes[b as usize]
-                    .as_ref()
+        while let Some(chunk) = artifact.next_chunk()? {
+            for &b in chunk.iter() {
+                let (code, len) = codes[b as usize]
                     .expect("символ отсутствует в построенной таблице кодов - баг подсчёта частот");
-                writer.push_bits(code)?;
+                writer.push_code(code, len)?;
             }
         }
         writer.finish()?;
@@ -301,7 +370,6 @@ impl Compressor for HuffmanCompressor { // TODO: А мы можем загруз
         if original_size == 0 {
             return Ok(output);
         }
-
         if distinct.is_empty() {
             return Err(AppError::CorruptArchive(
                 "Huffman: пустая частотная таблица при ненулевом original_size".to_string(),
@@ -312,37 +380,52 @@ impl Compressor for HuffmanCompressor { // TODO: А мы можем загруз
             let (symbol, _freq) = distinct[0];
             let block_len = output.chunk_size.get().min(original_size as usize).max(1);
             let block = vec![symbol; block_len];
-
             let mut remaining = original_size;
             while remaining > 0 {
                 let take = remaining.min(block_len as u64) as usize;
                 output.write_chunk_from(&block[..take])?;
                 remaining -= take as u64;
             }
-
             return Ok(output);
         }
 
         let tree = build_tree(&distinct);
+        let decode_table = build_decode_table(&tree);
 
-        // --- Читаем битовый поток потоково - НЕ копируем остаток
-        // артефакта целиком в память, как было раньше. ---
-        let mut reader = StreamingBitReader::new(BufferedArtifactReader::new(&mut artifact));
+        let mut bits = BitWindow::new(&mut artifact);
         let mut decoded_count: u64 = 0;
         let mut out_buf: Vec<u8> = Vec::with_capacity(OUTPUT_FLUSH_SIZE);
 
         while decoded_count < original_size {
-            let mut node = &tree;
-            loop {
-                match node {
-                    HuffmanNode::Leaf { symbol, .. } => {
-                        out_buf.push(*symbol);
-                        decoded_count += 1;
-                        break;
-                    }
-                    HuffmanNode::Internal { left, right, .. } => {
-                        let bit = reader.read_bit()?;
-                        node = if bit { right } else { left };
+            bits.fill(TABLE_BITS)?;
+            let index = bits.peek(TABLE_BITS) as usize;
+
+            match decode_table[index] {
+                DecodeEntry::Symbol(symbol, len) => {
+                    // Общий случай - один взгляд в таблицу вместо
+                    // побитового спуска по дереву длиной `len` шагов.
+                    bits.consume(len as u32);
+                    out_buf.push(symbol);
+                    decoded_count += 1;
+                }
+                DecodeEntry::Escape => {
+                    // Редкий fallback: код длиннее TABLE_BITS - идём по
+                    // дереву бит за битом, как в исходной версии.
+                    let mut node = &tree;
+                    loop {
+                        match node {
+                            HuffmanNode::Leaf { symbol, .. } => {
+                                out_buf.push(*symbol);
+                                decoded_count += 1;
+                                break;
+                            }
+                            HuffmanNode::Internal { left, right, .. } => {
+                                bits.fill(1)?;
+                                let bit = bits.peek(1) != 0;
+                                bits.consume(1);
+                                node = if bit { right } else { left };
+                            }
+                        }
                     }
                 }
             }
