@@ -68,7 +68,7 @@ pub fn crc32_of_artifact_and_rewind(artifact: &mut Artifact, pipeline_settings: 
     // а не Vec::with_capacity(chunk_size). Иначе будет запись в неинициализированную память!
 
     loop {
-        let readed_bytes: usize = artifact.read_chunk(&mut buffer)?;
+        let readed_bytes: usize = artifact.read_chunk_to(&mut buffer)?;
         if readed_bytes == 0 { break; }
         crc32.update(&buffer[..readed_bytes]);
     }

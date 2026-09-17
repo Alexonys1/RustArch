@@ -10,10 +10,10 @@ use super::utils::BufferedArtifactReader;
 /// Размер алфавита - все возможные значения одного байта.
 const ALPHABET_SIZE: usize = 256;
 
-/// Порог сброса накопленного битового буфера в Artifact::write_chunk.
+/// Порог сброса накопленного битового буфера в Artifact::write_chunk_from.
 /// Ограничивает буфер константой независимо от размера файла - раньше
 /// весь сжатый поток целиком копился в памяти до единственной записи
-/// в конце (`output.write_chunk(&writer.finish())`), это и было причиной
+/// в конце (`output.write_chunk_from(&writer.finish())`), это и было причиной
 /// расхода памяти сверх заданного бюджета: этот буфер существовал в куче
 /// ДО того, как хоть один байт попадал в Artifact и мог быть учтён его
 /// внутренним BudgetGuard.
@@ -143,7 +143,7 @@ impl<'a> StreamingBitWriter<'a> {
             self.cur = 0;
             self.nbits = 0;
             if self.buf.len() >= OUTPUT_FLUSH_SIZE {
-                self.output.write_chunk(&self.buf)?;
+                self.output.write_chunk_from(&self.buf)?;
                 self.buf.clear();
             }
         }
@@ -166,7 +166,7 @@ impl<'a> StreamingBitWriter<'a> {
             self.buf.push(self.cur);
         }
         if !self.buf.is_empty() {
-            self.output.write_chunk(&self.buf)?;
+            self.output.write_chunk_from(&self.buf)?;
         }
         Ok(())
     }
@@ -205,7 +205,7 @@ fn read_exact_from_artifact(artifact: &mut Artifact, n: usize) -> Result<Vec<u8>
     let mut filled = 0;
 
     while filled < n {
-        let read = artifact.read_chunk(&mut buf[filled..])?;
+        let read = artifact.read_chunk_to(&mut buf[filled..])?;
         if read == 0 {
             return Err(AppError::CorruptArchive(
                 "Huffman: неожиданный конец потока при чтении заголовка".to_string(),
@@ -229,7 +229,7 @@ impl Compressor for HuffmanCompressor { // TODO: А мы можем загруз
         let mut freqs = [0u64; ALPHABET_SIZE];
         let mut original_size: u64 = 0;
 
-        while let Some(chunk) = artifact.read_next_chunk()? {
+        while let Some(chunk) = artifact.read_next_chunk_with_clone()? {
             for &b in &chunk {
                 freqs[b as usize] += 1;
             }
@@ -239,7 +239,7 @@ impl Compressor for HuffmanCompressor { // TODO: А мы можем загруз
 
         let mut output = Artifact::new_with_temp_file_suffix(&artifact, "compressed");
 
-        output.write_chunk(&original_size.to_le_bytes())?;
+        output.write_chunk_from(&original_size.to_le_bytes())?;
 
         let distinct: Vec<(u8, u64)> = freqs
             .iter()
@@ -248,10 +248,10 @@ impl Compressor for HuffmanCompressor { // TODO: А мы можем загруз
             .map(|(symbol, &f)| (symbol as u8, f))
             .collect();
 
-        output.write_chunk(&(distinct.len() as u32).to_le_bytes())?;
+        output.write_chunk_from(&(distinct.len() as u32).to_le_bytes())?;
         for &(symbol, freq) in &distinct {
-            output.write_chunk(&[symbol])?;
-            output.write_chunk(&freq.to_le_bytes())?;
+            output.write_chunk_from(&[symbol])?;
+            output.write_chunk_from(&freq.to_le_bytes())?;
         }
 
         if original_size == 0 || distinct.len() <= 1 {
@@ -266,7 +266,7 @@ impl Compressor for HuffmanCompressor { // TODO: А мы можем загруз
         // --- Второй проход: кодируем данные, сбрасывая биты по мере
         // накопления, а не храня весь сжатый поток в памяти до конца. ---
         let mut writer = StreamingBitWriter::new(&mut output);
-        while let Some(chunk) = artifact.read_next_chunk()? {
+        while let Some(chunk) = artifact.read_next_chunk_with_clone()? {
             for &b in &chunk {
                 let code = codes[b as usize]
                     .as_ref()
@@ -316,7 +316,7 @@ impl Compressor for HuffmanCompressor { // TODO: А мы можем загруз
             let mut remaining = original_size;
             while remaining > 0 {
                 let take = remaining.min(block_len as u64) as usize;
-                output.write_chunk(&block[..take])?;
+                output.write_chunk_from(&block[..take])?;
                 remaining -= take as u64;
             }
 
@@ -348,13 +348,13 @@ impl Compressor for HuffmanCompressor { // TODO: А мы можем загруз
             }
 
             if out_buf.len() >= OUTPUT_FLUSH_SIZE {
-                output.write_chunk(&out_buf)?;
+                output.write_chunk_from(&out_buf)?;
                 out_buf.clear();
             }
         }
 
         if !out_buf.is_empty() {
-            output.write_chunk(&out_buf)?;
+            output.write_chunk_from(&out_buf)?;
         }
 
         Ok(output)

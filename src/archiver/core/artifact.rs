@@ -85,14 +85,30 @@ impl Artifact {
         }
     }
 
-    pub fn save_as_finish_file<FilePath: AsRef<Path>>(mut self, new_path: &FilePath) -> io::Result<()> {
+    pub fn save_as_finish_file(mut self, new_path: &Path) -> io::Result<()> {
         match &self.state {
             ArtifactState::File { .. } => {
                 let old_path: &Path = self.file_path.as_ref();
                 fs::rename(old_path, new_path)?;
             }
+            
             ArtifactState::Memory { data, .. } => fs::write(new_path, data)?,
-            ArtifactState::FileWindow { .. } => return Err(io::Error::from(io::ErrorKind::ReadOnlyFilesystem)),
+            
+            ArtifactState::FileWindow { file, base_offset, len } => {
+                let mut source = file.try_clone()?; // отдельный курсор чтения, не мешающий остальным операциям с этим же file
+                source.seek(SeekFrom::Start(*base_offset))?;
+
+                let mut out = fs::File::create(new_path)?;
+                let mut remaining = *len;
+                let mut buffer = vec![0u8; self.chunk_size.get()];
+
+                while remaining > 0 {
+                    let want = remaining.min(buffer.len() as u64) as usize;
+                    source.read_exact(&mut buffer[..want])?;
+                    out.write_all(&buffer[..want])?;
+                    remaining -= want as u64;
+                }
+            }
         }
         // Файл уже переименован/записан по новому пути - Drop не должен
         // пытаться удалить то, чего по старому пути больше не существует.
@@ -101,7 +117,7 @@ impl Artifact {
     }
 
     pub fn write_to_file_end(&mut self, sink: &mut File) -> io::Result<()> {
-        while let Some(chunk) = self.new__next_chunk()? {
+        while let Some(chunk) = self.next_chunk()? {
             sink.write_all(&chunk)?;
         }
 
@@ -130,24 +146,27 @@ impl Artifact {
         self.file_path.as_path()
     }
 
+    // TODO: Подумать над надобностью этой функции. Может, сигнатуру нужно переписать.
     /// Если данные на диске, то будет возвращён None.
     /// Если данные в оперативной памяти, то будет возвращён Some
-    pub fn new__next_mut_chunk(&mut self) -> io::Result<Option<&mut [u8]>> {
+    pub fn next_mut_chunk_from_memory(&mut self) -> io::Result<Option<&mut [u8]>> {
         match &mut self.state {
             ArtifactState::File { .. } => Ok(None),
+            
             ArtifactState::Memory { data, .. } => {
                 let to_read_bytes = data.len().saturating_sub(self.reading_position);
                 let result = Ok(Some(&mut data[self.reading_position..self.reading_position + to_read_bytes]));
                 self.reading_position += to_read_bytes;
                 result
             }
+            
             ArtifactState::FileWindow { .. } => Ok(None),
         }
     }
 
     /// Возвращает Ok(Some(Cow)) длиной <= chunk_size, если данные можно прочесть.
     /// Если данные закончились (курсор уехал за пределы файла или массива), то вернётся Ok(None).
-    pub fn new__next_chunk(&mut self) -> io::Result<Option<Cow<'_, [u8]>>> {
+    pub fn next_chunk(&mut self) -> io::Result<Option<Cow<'_, [u8]>>> {
         match &mut self.state {
             ArtifactState::File { file, .. } => {
                 file.seek(SeekFrom::Start(self.reading_position as u64))?;
@@ -201,7 +220,7 @@ impl Artifact {
 
     /// Читает до `chunk_size` байт (или меньше, если `buf` меньше) с
     /// текущей позиции чтения. `0` означает конец данных.
-    pub fn read_chunk(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+    pub fn read_chunk_to(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let max_to_read = buf.len().min(self.chunk_size.get());
         let actual_buf = &mut buf[..max_to_read];
 
@@ -219,6 +238,7 @@ impl Artifact {
                 self.reading_position += filled;
                 Ok(filled)
             }
+            
             ArtifactState::Memory { data, .. } => {
                 let remaining_of_bytes = data.len().saturating_sub(self.reading_position);
                 let to_read_bytes = remaining_of_bytes.min(max_to_read);
@@ -227,6 +247,7 @@ impl Artifact {
                 self.reading_position += to_read_bytes;
                 Ok(to_read_bytes)
             }
+            
             ArtifactState::FileWindow { file, base_offset, len } => {
                 let remaining = (*len).saturating_sub(self.reading_position as u64);
                 let to_read = (remaining as usize).min(max_to_read);
@@ -249,11 +270,11 @@ impl Artifact {
         }
     }
 
-    /// Обёртка над `read_chunk`: сама выделяет буфер размера
+    /// Обёртка над `read_chunk_to`: сама выделяет буфер размера
     /// `chunk_size` и возвращает `None` на конце данных.
-    pub fn read_next_chunk(&mut self) -> io::Result<Option<Vec<u8>>> {
+    pub fn read_next_chunk_with_clone(&mut self) -> io::Result<Option<Vec<u8>>> {
         let mut buf = vec![0u8; self.chunk_size.get()];
-        let filled = self.read_chunk(&mut buf)?;
+        let filled = self.read_chunk_to(&mut buf)?;
 
         if filled == 0 {
             return Ok(None);
@@ -266,15 +287,15 @@ impl Artifact {
     /// Записывает ВЕСЬ `buf` с текущей позиции записи, при необходимости
     /// разбивая его на куски по `chunk_size` - частичная запись невозможна:
     /// либо весь буфер будет записан, либо вернётся ошибка.
-    pub fn write_chunk(&mut self, buf: &[u8]) -> io::Result<()> {
+    pub fn write_chunk_from(&mut self, buf: &[u8]) -> io::Result<()> {
         let mut offset = 0;
 
         while offset < buf.len() {
-            let written = self.write_chunk_once(&buf[offset..])?;
+            let written = self.write_chunk_once_from(&buf[offset..])?;
             if written == 0 {
                 return Err(io::Error::new(
                     io::ErrorKind::WriteZero,
-                    "Artifact::write_chunk: нулевая запись", // TODO: А нужно ли?
+                    "Artifact::write_chunk_from: нулевая запись", // TODO: А нужно ли?
                 ));
             }
             offset += written;
@@ -297,15 +318,14 @@ impl Artifact {
 
     /// Скопирует данные артефакта в Writable.
     pub fn copy_into<Writable: Write>(&mut self, dest: &mut Writable) -> io::Result<()> {
-        while let Some(chunk) = self.read_next_chunk()? {
+        while let Some(chunk) = self.read_next_chunk_with_clone()? {
             dest.write_all(&chunk)?;
         }
         Ok(())
     }
-
-
+    
     /// Записывает не больше `chunk_size` байт за один вызов. Двигает курсор.
-    fn write_chunk_once(&mut self, buf: &[u8]) -> io::Result<usize> {
+    fn write_chunk_once_from(&mut self, buf: &[u8]) -> io::Result<usize> {
         let max_to_write = buf.len().min(self.chunk_size.get());
         let actual_buf = &buf[..max_to_write];
 
@@ -346,7 +366,7 @@ impl Artifact {
 
                         self.state = ArtifactState::File { file, size: data.len() };
 
-                        return self.write_chunk_once(buf);
+                        return self.write_chunk_once_from(buf);
                     }
                 }
 

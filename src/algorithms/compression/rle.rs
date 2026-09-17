@@ -22,7 +22,7 @@ impl Compressor for RleCompressor {
             }
         }
 
-        while let Some(chunk) = artifact.read_next_chunk()? {
+        while let Some(chunk) = artifact.read_next_chunk_with_clone()? {
             for &b in &chunk {
                 match current_byte {
                     Some(cb) if cb == b && current_count < 255 => current_count += 1,
@@ -38,14 +38,14 @@ impl Compressor for RleCompressor {
                 }
             }
             if !out_buf.is_empty() {
-                output.write_chunk(&out_buf)?;
+                output.write_chunk_from(&out_buf)?;
                 out_buf.clear();
             }
         }
 
         if let Some(cb) = current_byte {
             flush_run(cb, current_count, &mut out_buf);
-            output.write_chunk(&out_buf)?;
+            output.write_chunk_from(&out_buf)?;
         }
 
         Ok(output)
@@ -56,7 +56,7 @@ impl Compressor for RleCompressor {
         let mut pending_count: Option<u8> = None;
         let mut out_buf: Vec<u8> = Vec::with_capacity(8192);
 
-        while let Some(chunk) = artifact.read_next_chunk()? {
+        while let Some(chunk) = artifact.read_next_chunk_with_clone()? {
             for &b in &chunk {
                 match pending_count.take() {
                     None => pending_count = Some(b),
@@ -64,7 +64,7 @@ impl Compressor for RleCompressor {
                 }
             }
             if !out_buf.is_empty() {
-                output.write_chunk(&out_buf)?;
+                output.write_chunk_from(&out_buf)?;
                 out_buf.clear();
             }
         }

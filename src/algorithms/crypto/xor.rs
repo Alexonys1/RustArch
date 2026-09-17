@@ -17,7 +17,7 @@ impl Cipher for XorCipher {
             let mut output = Artifact::new_with_temp_file_suffix(&artifact, "encoded");
             let mut key_pos: usize = 0;
 
-            while let Some(chunk) = artifact.new__next_chunk()? {
+            while let Some(chunk) = artifact.next_chunk()? {
                 let mut chunk = chunk.to_vec(); // Здесь в любом случае Borrowed
 
                 for byte in chunk.iter_mut() {
@@ -28,7 +28,7 @@ impl Cipher for XorCipher {
                         key_pos = 0;
                     }
                 }
-                output.write_chunk(&chunk)?;
+                output.write_chunk_from(&chunk)?;
             }
 
             Ok(output)
@@ -37,7 +37,7 @@ impl Cipher for XorCipher {
             artifact.rewind_reading();
             let mut key_pos = 0;
 
-            while let Some(chunk) = artifact.new__next_chunk()? {
+            while let Some(chunk) = artifact.next_chunk()? {
                 let chunk: &mut [u8] = unsafe { cow_borrowed_to_mut(chunk) };
 
                 for byte in chunk.iter_mut() {

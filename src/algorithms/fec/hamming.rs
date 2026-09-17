@@ -27,8 +27,8 @@
 //! Блоки Хэмминга полностью независимы друг от друга (в отличие, например,
 //! от LZ77, которому нужно окно предыдущих данных) - это значит, что нет
 //! никакой необходимости держать весь файл в памяти целиком. Реализация
-//! читает и пишет данные чанками через `Artifact::read_next_chunk` /
-//! `write_chunk`, перекладывая биты между чтением и записью через
+//! читает и пишет данные чанками через `Artifact::read_next_chunk_with_clone` /
+//! `write_chunk_from`, перекладывая биты между чтением и записью через
 //! маленький (постоянного размера, не зависящего от размера файла)
 //! битовый аккумулятор на регистрах `u64`/`u32` - без единой аллокации на
 //! блок и без промежуточных `Vec<bool>` (каждый элемент которого в Rust
@@ -110,7 +110,7 @@ fn read_exact_from_artifact(artifact: &mut Artifact, n: usize) -> Result<Vec<u8>
     let mut filled = 0;
 
     while filled < n {
-        let read = artifact.read_chunk(&mut buf[filled..])?;
+        let read = artifact.read_chunk_to(&mut buf[filled..])?;
         if read == 0 {
             return Err(AppError::Fec(
                 "Hamming: неожиданный конец потока при чтении заголовка".to_string(),
@@ -301,7 +301,7 @@ impl BitSource {
 /// в артефакт. Это и есть основной механизм, ограничивающий пиковую
 /// дополнительную память константой `flush_threshold` независимо от
 /// размера файла - вместо того, чтобы копить весь результат в памяти и
-/// сбрасывать одним огромным `write_chunk` в конце.
+/// сбрасывать одним огромным `write_chunk_from` в конце.
 struct BitSink {
     bits: u64,
     count: u32,
@@ -344,7 +344,7 @@ impl BitSink {
 
     fn maybe_flush(&mut self, output: &mut Artifact) -> Result<(), AppError> {
         if self.out.len() >= self.flush_threshold {
-            output.write_chunk(&self.out)?;
+            output.write_chunk_from(&self.out)?;
             self.out.clear();
         }
         Ok(())
@@ -352,7 +352,7 @@ impl BitSink {
 
     fn final_flush(&mut self, output: &mut Artifact) -> Result<(), AppError> {
         if !self.out.is_empty() {
-            output.write_chunk(&self.out)?;
+            output.write_chunk_from(&self.out)?;
             self.out.clear();
         }
         Ok(())
@@ -372,13 +372,13 @@ impl ErrorCorrectionCode for HammingCode {
         // заголовок ДО тела потока, не читая (и тем более не храня) файл
         // целиком дважды одновременно.
         let mut original_size: u64 = 0;
-        while let Some(chunk) = artifact.read_next_chunk()? {
+        while let Some(chunk) = artifact.read_next_chunk_with_clone()? {
             original_size += chunk.len() as u64;
         }
         artifact.rewind_reading();
 
         let mut output = Artifact::new_with_temp_file_suffix(&artifact, "fec_encoded");
-        output.write_chunk(&original_size.to_le_bytes())?;
+        output.write_chunk_from(&original_size.to_le_bytes())?;
 
         // Порог сброса накопленного выходного буфера - ограничивает
         // пиковую дополнительную память константой (размером чанка), а не
@@ -388,7 +388,7 @@ impl ErrorCorrectionCode for HammingCode {
         let mut source = BitSource::new();
         let mut sink = BitSink::new(flush_threshold);
 
-        while let Some(chunk) = artifact.read_next_chunk()? {
+        while let Some(chunk) = artifact.read_next_chunk_with_clone()? {
             for &byte in &chunk {
                 source.push_byte(byte);
                 while let Some(data_bits) = source.try_take(k as u32) {
@@ -432,7 +432,7 @@ impl ErrorCorrectionCode for HammingCode {
         let mut source = BitSource::new();
         let mut sink = BitSink::new(flush_threshold);
 
-        'outer: while let Some(chunk) = artifact.read_next_chunk()? {
+        'outer: while let Some(chunk) = artifact.read_next_chunk_with_clone()? {
             for &byte in &chunk {
                 source.push_byte(byte);
 
@@ -506,7 +506,7 @@ mod tests {
 
         let mut out = Vec::new();
         decoded.rewind_reading();
-        while let Some(chunk) = decoded.read_next_chunk().unwrap() {
+        while let Some(chunk) = decoded.read_next_chunk_with_clone().unwrap() {
             out.extend_from_slice(&chunk);
         }
         assert_eq!(out, data);
@@ -615,7 +615,7 @@ mod tests {
 
         let mut encoded_artifact = codec.encode(artifact_from_bytes(&data)).unwrap();
         let mut encoded_bytes = Vec::new();
-        while let Some(chunk) = encoded_artifact.read_next_chunk().unwrap() {
+        while let Some(chunk) = encoded_artifact.read_next_chunk_with_clone().unwrap() {
             encoded_bytes.extend_from_slice(&chunk);
         }
 

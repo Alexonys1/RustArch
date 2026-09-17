@@ -1,7 +1,7 @@
+use crate::error::AppError;
 use super::{Compressor, compression};
 use super::{Cipher, crypto};
 use super::{ErrorCorrectionCode, fec};
-use crate::error::AppError;
 
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -13,6 +13,7 @@ pub enum CompressionId {
     LZSS = 4,
     Deflate = 5,
 }
+
 
 impl CompressionId {
     pub fn as_u8(self) -> u8 {
@@ -96,7 +97,7 @@ impl FecId {
         use FecId::*;
         match self {
             NoFec => Box::new(fec::NoneFec),
-            Hamming => Box::new(fec::HammingCode::new_7_4()),
+            _hamming => Box::new(fec::HammingCode::new_7_4()),
         }
     }
 

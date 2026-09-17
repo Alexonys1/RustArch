@@ -23,7 +23,7 @@ const TAG_MATCH_AT_EOF: u8 = 2;
 const WINDOW_SIZE: usize = 65_535;
 const LOOKAHEAD_SIZE: usize = 255;
 
-/// Порог сброса накопленного выходного буфера в Artifact::write_chunk -
+/// Порог сброса накопленного выходного буфера в Artifact::write_chunk_from -
 /// см. подробное объяснение в lzss.rs. Ограничивает выходной буфер
 /// константой независимо от размера файла, вместо `encoded: Vec<u8>`,
 /// растущего до конца обработки.
@@ -60,7 +60,7 @@ impl Compressor for Lz77Compressor {
         // единого обращения к самим данным файла.
         let n = artifact.get_payload_size() as u64;
         let mut output = Artifact::new_with_temp_file_suffix(&artifact, "compressed");
-        output.write_chunk(&n.to_le_bytes())?;
+        output.write_chunk_from(&n.to_le_bytes())?;
 
         // Как и в LZSS: единственное, что держится в памяти - ограниченное
         // окно и хэш-таблицы фиксированного размера, НЕ зависящие от
@@ -118,7 +118,7 @@ impl Compressor for Lz77Compressor {
         }
 
         if !out_buf.is_empty() {
-            output.write_chunk(&out_buf)?;
+            output.write_chunk_from(&out_buf)?;
         }
 
         Ok(output)
@@ -127,7 +127,7 @@ impl Compressor for Lz77Compressor {
     fn decompress(&self, mut artifact: Artifact) -> Result<Artifact, AppError> {
         let mut output = Artifact::new_with_temp_file_suffix(&artifact, "decompressed");
 
-        // Буферизованное чтение токенов вместо read_chunk по 1-2 байта
+        // Буферизованное чтение токенов вместо read_chunk_to по 1-2 байта
         // напрямую из Artifact - см. подробности в lzss.rs.
         let mut reader = BufferedArtifactReader::new(&mut artifact);
         let original_size = u64::from_le_bytes(reader.read_exact(8)?.try_into().unwrap());
@@ -191,13 +191,13 @@ impl Compressor for Lz77Compressor {
             }
 
             if out_buf.len() >= OUTPUT_FLUSH_SIZE {
-                output.write_chunk(&out_buf)?;
+                output.write_chunk_from(&out_buf)?;
                 out_buf.clear();
             }
         }
 
         if !out_buf.is_empty() {
-            output.write_chunk(&out_buf)?;
+            output.write_chunk_from(&out_buf)?;
         }
 
         Ok(output)

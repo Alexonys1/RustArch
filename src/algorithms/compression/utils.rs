@@ -63,7 +63,7 @@ impl SlidingWindow {
 
     pub fn ensure_available(&mut self, artifact: &mut Artifact, pos: u64, want: usize) -> io::Result<()> {
         while !self.exhausted && self.available_after(pos) < want {
-            match artifact.read_next_chunk()? {
+            match artifact.read_next_chunk_with_clone()? {
                 Some(chunk) => self.buffer.extend_from_slice(&chunk),
                 None => self.exhausted = true,
             }
@@ -295,7 +295,7 @@ impl<'a> BufferedArtifactReader<'a> {
                 self.buf.drain(0..self.pos);
                 self.pos = 0;
             }
-            match self.artifact.read_next_chunk()? {
+            match self.artifact.read_next_chunk_with_clone()? {
                 Some(chunk) => self.buf.extend_from_slice(&chunk),
                 None => {
                     return Err(AppError::CorruptArchive(
@@ -317,7 +317,7 @@ impl<'a> BufferedArtifactReader<'a> {
 
 pub fn flush_if_needed(out_buf: &mut Vec<u8>, output: &mut Artifact, output_flush_size: usize) -> Result<(), AppError> {
     if out_buf.len() >= output_flush_size {
-        output.write_chunk(out_buf)?;
+        output.write_chunk_from(out_buf)?;
         out_buf.clear();
     }
     Ok(())

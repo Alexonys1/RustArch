@@ -112,7 +112,7 @@ impl Compressor for LzssCompressor {
 
         let original_size = artifact.get_payload_size() as u64;
         let mut output = Artifact::new_with_temp_file_suffix(&artifact, "compressed");
-        output.write_chunk(&original_size.to_le_bytes())?;
+        output.write_chunk_from(&original_size.to_le_bytes())?;
 
         let mut window = SlidingWindow::new(WINDOW_SIZE, LOOKAHEAD_SIZE)?;
         let mut chain = HashChain::new(WINDOW_SIZE)?;
@@ -175,7 +175,7 @@ impl Compressor for LzssCompressor {
         // в самом конце файла потерялись бы, оставшись в `group.bodies`.
         group.flush(&mut out_buf);
         if !out_buf.is_empty() {
-            output.write_chunk(&out_buf)?;
+            output.write_chunk_from(&out_buf)?;
         }
 
         Ok(output)
@@ -238,14 +238,14 @@ impl Compressor for LzssCompressor {
                 }
 
                 if out_buf.len() >= OUTPUT_FLUSH_SIZE {
-                    output.write_chunk(&out_buf)?;
+                    output.write_chunk_from(&out_buf)?;
                     out_buf.clear();
                 }
             }
         }
 
         if !out_buf.is_empty() {
-            output.write_chunk(&out_buf)?;
+            output.write_chunk_from(&out_buf)?;
         }
 
         Ok(output)
@@ -261,7 +261,7 @@ impl Compressor for LzssCompressor {
 
 fn flush_if_needed(out_buf: &mut Vec<u8>, output: &mut Artifact) -> Result<(), AppError> {
     if out_buf.len() >= OUTPUT_FLUSH_SIZE {
-        output.write_chunk(out_buf)?;
+        output.write_chunk_from(out_buf)?;
         out_buf.clear();
     }
     Ok(())

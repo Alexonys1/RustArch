@@ -1,7 +1,6 @@
-use std::cmp::Reverse;
 use std::collections::BinaryHeap;
-use std::path::Path;
 use std::sync::mpsc::Sender;
+use std::cmp::Reverse;
 use std::thread;
 
 use crate::algorithms::PipelineSettings;
@@ -19,7 +18,8 @@ pub fn pack_files_parallel(
     pipeline_settings: PipelineSettings,
     encode_key: &[u8],
     artifact_sender: Sender<(ArchivedArtifactEntry, Artifact)>,
-) -> Result<Vec<ArchivedArtifactEntry>, AppError> {
+) -> Result<Vec<ArchivedArtifactEntry>, AppError>
+{
     let groups_of_files = group_files_for_workers(&files)?;
 
     thread::scope(|scope| {
@@ -43,6 +43,7 @@ pub fn pack_files_parallel(
     })
 }
 
+
 fn start_packing_file_group(
     file_group: &[&WalkedFile],
     pipeline_settings: PipelineSettings,
@@ -57,6 +58,7 @@ fn start_packing_file_group(
 
     Ok(result)
 }
+
 
 fn group_files_for_workers(files: &[WalkedFile]) -> Result<Vec<Vec<&WalkedFile>>, AppError> {
     if files.is_empty() {
