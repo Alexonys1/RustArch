@@ -63,7 +63,7 @@ impl SlidingWindow {
 
     pub fn ensure_available(&mut self, artifact: &mut Artifact, pos: u64, want: usize) -> io::Result<()> {
         while !self.exhausted && self.available_after(pos) < want {
-            match artifact.read_next_chunk_with_clone()? {
+            match artifact.next_chunk()? {
                 Some(chunk) => self.buffer.extend_from_slice(&chunk),
                 None => self.exhausted = true,
             }
@@ -295,7 +295,7 @@ impl<'a> BufferedArtifactReader<'a> {
                 self.buf.drain(0..self.pos);
                 self.pos = 0;
             }
-            match self.artifact.read_next_chunk_with_clone()? {
+            match self.artifact.next_chunk()? {
                 Some(chunk) => self.buf.extend_from_slice(&chunk),
                 None => {
                     return Err(AppError::CorruptArchive(
@@ -321,4 +321,225 @@ pub fn flush_if_needed(out_buf: &mut Vec<u8>, output: &mut Artifact, output_flus
         out_buf.clear();
     }
     Ok(())
+}
+
+
+
+// =====================================================================
+// ReverseChain — хэш-цепочка для ОБРАТНЫХ совпадений
+// =====================================================================
+//
+// Отличие от HashChain: позиция `b` индексируется по ОБРАТНОМУ 3-грамму
+// (window[b], window[b-1], window[b-2]), а не по прямому
+// (window[b], window[b+1], window[b+2]). Это позволяет по 3-байтовому
+// префиксу lookahead-а (input[pos..pos+3]) находить в окне такие `b`,
+// что window[b]=input[pos], window[b-1]=input[pos+1], window[b-2]=input[pos+2],
+// т.е. кандидатов на ОБРАТНОЕ совпадение:
+//     window[a + i] == input[pos + L - 1 - i]   для i in 0..L,
+// где a = b - L + 1.
+//
+// Память: те же два массива фиксированного размера, что и у HashChain
+// (HASH_SIZE + window_size записей u64). Trim не нужен: старые позиции
+// отсекаются на этапе candidates() по границе окна.
+pub struct ReverseChain {
+    head: Vec<u64>,
+    prev: Vec<u64>,
+    window_size: usize,
+    _guard: BudgetGuard,
+}
+
+impl ReverseChain {
+    pub fn new(window_size: usize) -> Result<Self, AppError> {
+        let bytes = (HASH_SIZE + window_size) * std::mem::size_of::<u64>();
+        let mut guard = BudgetGuard::default();
+        if !guard.try_grow(bytes as i64) {
+            return Err(AppError::Compression(format!(
+                "LZSS: не удалось зарезервировать {bytes} байт под обратную хэш-таблицу - бюджет памяти исчерпан"
+            )));
+        }
+        Ok(Self {
+            head: vec![NONE; HASH_SIZE],
+            prev: vec![NONE; window_size],
+            window_size,
+            _guard: guard,
+        })
+    }
+
+    fn hash3(b0: u8, b1: u8, b2: u8) -> usize {
+        let v = (b0 as u32) | ((b1 as u32) << 8) | ((b2 as u32) << 16);
+        ((v.wrapping_mul(2_654_435_761)) >> (32 - HASH_BITS)) as usize
+    }
+
+    /// Индексирует позицию `pos` как КОНЕЦ обратного 3-грамма:
+    /// хэшируется тройка (window[pos], window[pos-1], window[pos-2]).
+    /// Требует pos >= 2 и чтобы байты pos-2..=pos были в буфере.
+    ///
+    /// Инвариант: компрессор вызывает insert() только для позиций,
+    /// прошедших `SlidingWindow::trim_if_needed` (или находящихся в
+    /// начале потока), поэтому `pos - 2 >= base_pos` здесь всегда
+    /// выполняется и `byte_at(pos - 2)` не паникует.
+    pub fn insert(&mut self, window: &SlidingWindow, pos: u64) {
+        if pos < 2 {
+            return;
+        }
+        if window.available_after(pos - 2) < 3 {
+            return;
+        }
+        let b0 = window.byte_at(pos);
+        let b1 = window.byte_at(pos - 1);
+        let b2 = window.byte_at(pos - 2);
+        let h = Self::hash3(b0, b1, b2);
+        let slot = (pos as usize) % self.window_size;
+        self.prev[slot] = self.head[h];
+        self.head[h] = pos;
+    }
+
+    /// Итератор по кандидатам `b` (КОНЕЦ обратного региона в окне),
+    /// упорядоченным от самых свежих к самым старым. Останавливается,
+    /// когда очередная позиция уходит за границу `window_start`.
+    fn candidates(
+        &self,
+        window: &SlidingWindow,
+        pos: u64,
+        window_start: u64,
+    ) -> impl Iterator<Item = u64> + '_ {
+        let (b0, b1, b2) = (
+            window.byte_at(pos),
+            window.byte_at(pos + 1),
+            window.byte_at(pos + 2),
+        );
+        let h = Self::hash3(b0, b1, b2);
+        let mut cur = self.head[h];
+        let window_size = self.window_size;
+        let prev = &self.prev;
+        std::iter::from_fn(move || {
+            if cur == NONE || cur < window_start {
+                return None;
+            }
+            let result = cur;
+            cur = prev[(cur as usize) % window_size];
+            Some(result)
+        })
+    }
+
+    /// No-op. Нужен для симметрии с API HashChain: устаревшие записи
+    /// отфильтровываются в `candidates` по `window_start`, а `prev`
+    /// использует модульную индексацию и перезаписывается естественным
+    /// образом на каждом insert.
+    pub fn trim_if_needed(&mut self, _pos: u64) {}
+}
+
+
+// =====================================================================
+// НОВОЕ: поиск ОБРАТНЫХ совпадений (используется в lzss_new.rs)
+// =====================================================================
+//
+// Всё выше этой черты - неизменная существующая реализация. Ниже -
+// единственная добавленная функция, использующая уже существующую
+// структуру `ReverseChain` (она была объявлена в файле раньше, но без
+// собственного алгоритма поиска - только индексация). Симметрична
+// `find_longest_match` выше, но:
+//   - использует `ReverseChain` вместо `HashChain`;
+//   - сравнивает байты окна в УБЫВАЮЩЕМ порядке индексов против входных
+//     данных в ВОЗРАСТАЮЩЕМ порядке (см. схему в комментарии к
+//     `ReverseChain`), а не два среза в одном и том же порядке;
+//   - обязана дополнительно ограничивать длину физической границей
+//     буфера ПОЗАДИ кандидата (`available_before`) - обратное совпадение,
+//     в отличие от прямого, не может самоссылаться в ещё не
+//     декодированные байты (весь исходный фрагмент лежит строго в уже
+//     пройденной истории), поэтому у него нет права "занимать" данные
+//     резервированием произвольной длины - оно жёстко ограничено тем,
+//     что физически ещё есть в буфере слева от кандидата.
+
+impl SlidingWindow {
+    /// Сколько байт "истории" физически ещё присутствует в буфере ДО и
+    /// ВКЛЮЧАЯ позицию `pos` (т.е. `pos - base_pos + 1`), с учётом уже
+    /// выполненных подрезок `trim_if_needed`. Нужно только для поиска
+    /// обратных совпадений - см. комментарий к `find_longest_reverse_match`.
+    pub fn available_before(&self, pos: u64) -> usize {
+        (pos.saturating_sub(self.base_pos) + 1) as usize
+    }
+}
+
+/// Аналог `common_prefix_len`, но для ОБРАТНЫХ совпадений: `cand_end`
+/// (конец обратного региона в окне) двигается НАЗАД, `pos` (текущая
+/// позиция разбора) двигается ВПЕРЁД. Направления сравнения
+/// противоположны, поэтому здесь нельзя напрямую переиспользовать приём
+/// сравнения по 8 байт через XOR из `common_prefix_len` (для этого
+/// потребовалось бы разворачивать один из двух фрагментов побайтово перед
+/// каждым сравнением) - используется простой побайтовый цикл. Это
+/// осознанный компромисс в пользу очевидной корректности: направленное
+/// сравнение - именно то место, где легко ошибиться на один индекс, а
+/// цена ошибки (молчаливо неверные данные при разборе) намного выше
+/// цены нескольких лишних тактов на сравнение.
+fn common_prefix_len_reverse(window: &SlidingWindow, cand_end: u64, pos: u64, max_len: usize) -> usize {
+    let limit = max_len
+        .min(window.available_before(cand_end))
+        .min(window.available_after(pos));
+
+    let mut len = 0usize;
+    while len < limit && window.byte_at(cand_end - len as u64) == window.byte_at(pos + len as u64) {
+        len += 1;
+    }
+    len
+}
+
+/// Ищет самое длинное ОБРАТНОЕ совпадение для данных, начинающихся в
+/// `pos`: такую позицию `b` в окне (`b < pos`), что
+/// `window[b - i] == input[pos + i]` для `i = 0..length` (окно читается
+/// справа налево). Возвращает `(offset, length)` в ТОЙ ЖЕ системе
+/// координат, что и `find_longest_match`: `offset = pos - b` - расстояние
+/// от текущей позиции назад до байта окна, равного `input[pos]` (в этом
+/// случае - до "старшего" конца обратного региона, а не до его начала).
+/// `(0, 0)`, если подходящего совпадения (длиной >= `min_match_len`) не
+/// нашлось.
+pub fn find_longest_reverse_match(
+    window: &SlidingWindow,
+    chain: &ReverseChain,
+    pos: u64,
+    window_size: u64,
+    max_len: usize,
+    min_match_len: usize,
+    max_chain_len: usize,
+) -> (usize, usize)
+{
+    if max_len < min_match_len || window.available_after(pos) < min_match_len {
+        return (0, 0);
+    }
+
+    let window_start = pos.saturating_sub(window_size);
+    let mut best_len = 0usize;
+    let mut best_offset = 0usize;
+
+    for (checked, cand_end) in chain.candidates(window, pos, window_start).enumerate() {
+        if checked >= max_chain_len {
+            break;
+        }
+
+        // Кандидат обязан быть строго в прошлом: обратное совпадение не
+        // может ссылаться на текущую или ещё не написанную позицию (в
+        // отличие от прямого, у него нет самоссылающегося случая). При
+        // корректном порядке вызовов (сначала поиск, потом insert текущей
+        // позиции) это всегда true само по себе - проверка здесь только
+        // как защита от неверного порядка вызовов в будущем.
+        if cand_end >= pos {
+            continue;
+        }
+
+        let len = common_prefix_len_reverse(window, cand_end, pos, max_len);
+
+        if len > best_len {
+            best_len = len;
+            best_offset = (pos - cand_end) as usize;
+            if best_len >= NICE_MATCH_LEN || best_len == max_len {
+                break; // "достаточно длинное" совпадение - дальше не ищем
+            }
+        }
+    }
+
+    if best_len >= min_match_len {
+        (best_offset, best_len)
+    } else {
+        (0, 0)
+    }
 }

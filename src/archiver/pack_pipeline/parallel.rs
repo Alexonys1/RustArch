@@ -20,7 +20,7 @@ pub fn pack_files_parallel(
     artifact_sender: Sender<(ArchivedArtifactEntry, Artifact)>,
 ) -> Result<Vec<ArchivedArtifactEntry>, AppError>
 {
-    let groups_of_files = group_files_for_workers(&files)?;
+    let groups_of_files = group_files_for_workers(&files, MAX_PARALLELISM)?;
 
     thread::scope(|scope| {
         let mut workers = Vec::with_capacity(groups_of_files.len());
@@ -60,7 +60,9 @@ fn start_packing_file_group(
 }
 
 
-fn group_files_for_workers(files: &[WalkedFile]) -> Result<Vec<Vec<&WalkedFile>>, AppError> {
+pub fn group_files_for_workers(files: &[WalkedFile], max_parallelism: usize) -> Result<Vec<Vec<&WalkedFile>>, AppError> {
+    assert!(max_parallelism > 0);
+
     if files.is_empty() {
         return Ok(Vec::new());
     }
@@ -69,7 +71,7 @@ fn group_files_for_workers(files: &[WalkedFile]) -> Result<Vec<Vec<&WalkedFile>>
         .map(|n| n.get())
         .unwrap_or(1)
         .min(files.len())
-        .min(MAX_PARALLELISM);
+        .min(max_parallelism);
 
     let mut sized_files = Vec::with_capacity(files.len());
     for file in files {
@@ -92,8 +94,12 @@ fn group_files_for_workers(files: &[WalkedFile]) -> Result<Vec<Vec<&WalkedFile>>
         group.sort_by_key(|&(size, _)| Reverse(size));
     }
 
-    Ok(groups
+    let result = groups
         .into_iter()
         .map(|group| group.into_iter().map(|(_, file)| file).collect())
-        .collect())
+        .collect();
+
+    //println!("{result:#?}");
+
+    Ok(result)
 }

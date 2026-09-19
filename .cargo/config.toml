@@ -1,2 +1,4 @@
 [alias]
 prof = "samply record cargo run -- --release --bin RustArch"
+test-all = "test -- --include-ignored"
+slow-tests = "test -- --ignored"

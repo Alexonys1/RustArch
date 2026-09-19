@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use crate::error::AppError;
 
 
+#[derive(Debug)]
 pub struct WalkedFile {
     pub absolute_path: PathBuf,
     /// Путь относительно корня архивации, всегда с '/'-разделителем.
@@ -25,7 +26,7 @@ impl WalkedFile {
 
 
 // TODO: Наверное, эти дженерики всё-таки лишние и можно было обойтись обычным &Path
-pub fn walk_directory_or_file<RootPath: AsRef<Path>>(root: &RootPath) -> Result<WalkResult, AppError> {
+pub fn walk_directory_or_file<RootPath: AsRef<Path> + ?Sized>(root: &RootPath) -> Result<WalkResult, AppError> {
     let root = root.as_ref(); // Дженерики в приватных функциях были правда лишние, пока я не додумался до let root = root.as_ref()
 
     if root.is_file() {
@@ -84,7 +85,6 @@ fn walk_recursive(
 }
 
 
-// TODO: Может, использовать дженерики с AsRef<Path> это избыточно?
 fn convert_to_platform_undepended_path(relative_path: &Path) -> String {
     // components() разбивает путь платформо-независимо;
     // склеиваем обратно через /, игнорируя ОС-специфичный разделитель.

@@ -86,6 +86,7 @@ pub enum FecId {
     NoFec = 0,
     Hamming7_4 = 1,
     Hamming15_11 = 2,
+    ReedSolomon = 3,
 }
 
 impl FecId {
@@ -97,7 +98,8 @@ impl FecId {
         use FecId::*;
         match self {
             NoFec => Box::new(fec::NoneFec),
-            _hamming => Box::new(fec::HammingCode::new_7_4()),
+            Hamming7_4 | Hamming15_11 => todo!(),
+            ReedSolomon => Box::new(fec::ReedSolomonCode),
         }
     }
 
@@ -107,6 +109,7 @@ impl FecId {
             0 => Ok(NoFec),
             1 => Ok(Hamming7_4),
             2 => Ok(Hamming15_11),
+            3 => Ok(ReedSolomon),
             other => Err(AppError::CorruptArchive(format!(
                 "Неизвестный fec_id: {other}"
             ))),

@@ -20,7 +20,7 @@ pub fn run_pack(
     source_path: &str,
     target_archive_path: &str,
     settings: PipelineSettings,
-    encode_key: Vec<u8>,
+    encode_key: &[u8],
 ) -> Result<(), AppError>
 {
     let source_path = Path::new(source_path);
@@ -63,13 +63,13 @@ pub fn run_pack(
 
 
 pub fn run_unpack(
-    source_path: &str,
-    target_unpack_path: &str,
+    archive_path: &str,
+    unpack_path: &str,
     decode_key: &[u8],
 ) -> Result<(), AppError>
 {
-    let source_path = Path::new(source_path);
-    let target_unpack_path = Path::new(target_unpack_path);
+    let source_path = Path::new(archive_path);
+    let target_unpack_path = Path::new(unpack_path);
 
     if !source_path.exists() {
         return Err(AppError::CLIUsage(format!(

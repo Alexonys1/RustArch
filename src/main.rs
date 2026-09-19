@@ -23,13 +23,17 @@ fn main() {
 
     // ========== Для теста: ==========
 
-    enum TestCLICommand { Pack, Unpack, }
-    let test_choice = TestCLICommand::Pack; // !МЕНЯТЬ ЗДЕСЬ!
+    enum TestCLICommand { Pack, Unpack, TestGrouping }
+    let test_choice = TestCLICommand::Pack; // !МЕНЯТЬ ЗДЕСЬ!   <==========================
+    const SOURCE_PATH:         &str = r"C:\Games\Battlefield 2142 Novgames RST";
+    const TARGET_ARCHIVE_PATH: &str = r".\test_data_for_removing\study.arch";
+    const UNPACK_PATH:         &str = r".\test_data_for_removing\unpacked";
+
 
     let cli_command: CLICommand = match test_choice {
         TestCLICommand::Pack => CLICommand::Pack {
-            source_path: r"C:\Games\Battlefield 2142 Novgames RST".into(), // Важно, что эти относительные пути именно строки,
-            target_archive_path: r".\test_data_for_removing\study.arch".into(), // которые можно менять
+            source_path: SOURCE_PATH.into(), // Важно, что эти относительные пути именно строки,
+            target_archive_path: TARGET_ARCHIVE_PATH.into(), // которые можно менять
             settings: PipelineSettings {
                 compression: CompressionId::Huffman,
                 cipher: CipherId::NoCipher,
@@ -39,10 +43,33 @@ fn main() {
         },
 
         TestCLICommand::Unpack => CLICommand::Unpack {
-            source_path: r"test_data_for_removing/study.arch".into(),
-            target_unpack_path: "test_data_for_removing/study".into(),
+            source_path: TARGET_ARCHIVE_PATH.into(),
+            target_unpack_path: UNPACK_PATH.into(),
             decode_key: (1..=255).collect(),
         },
+
+        TestCLICommand::TestGrouping => {
+            use crate::archiver::{group_files_for_workers, walk_directory_or_file, WalkedFile};
+
+            let start = std::time::Instant::now();
+            let walked_files: Vec<WalkedFile> = walk_directory_or_file(SOURCE_PATH).unwrap().files;
+            let groups: Vec<Vec<&WalkedFile>> = group_files_for_workers(&walked_files, 16).unwrap();
+            let elapsed = start.elapsed();
+
+            println!("Walked {:#?} files", groups);
+
+            for group in groups {
+                println!(
+                    "Files in group: {}\tTotal group size: {}",
+                    group.len(),
+                    group.iter().map(|f| f.get_size().unwrap()).sum::<u64>()
+                );
+            }
+
+            println!("Time of walking and grouping: {}ms", elapsed.as_millis());
+
+            std::process::exit(0);
+        }
 
     };
 
@@ -53,7 +80,7 @@ fn main() {
             target_archive_path,
             settings,
             encode_key,
-        } => run_pack(&source_path, &target_archive_path, settings, encode_key),
+        } => run_pack(&source_path, &target_archive_path, settings, &encode_key),
 
         CLICommand::Unpack {
             source_path,
