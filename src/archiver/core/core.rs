@@ -1,19 +1,17 @@
-use std::fs::OpenOptions;
 use std::io::{Seek, SeekFrom};
+use std::fs::OpenOptions;
 use std::path::Path;
 
-use crate::archiver::{read_entries_in_range, write_entry, write_footer, ArchiveEntry, ArchiveFooter, ArchivedArtifactEntry};
+use crate::archiver::{read_entries_in_range, write_entry, write_footer};
+use crate::archiver::{ArchiveEntry, ArchiveFooter, ArchivedArtifactEntry};
 use crate::error::AppError;
 
-/// Записывает записи пустых директорий в таблицу, которая находится после
-/// всех payload'ов. Финальный footer будет записан write_archive_header().
+
 pub fn write_empty_dirs(
     target_archive_path: &Path,
-    mut target_empty_dirs: Vec<String>,
-) -> Result<(), AppError> {
-    target_empty_dirs.sort();
-    target_empty_dirs.dedup();
-
+    target_empty_dirs: Vec<String>,
+) -> Result<(), AppError>
+{
     let mut archive_file = OpenOptions::new()
         .append(true)
         .open(target_archive_path)?;
@@ -34,21 +32,16 @@ pub fn write_empty_dirs(
     Ok(())
 }
 
-/// Завершает архив: добавляет записи файлов и фиксированный footer в конец.
-/// Payload'ы не перемещаются — их реальные offsets были назначены writer-потоком.
+
 pub fn write_archive_header(
     target_archive_path: &Path,
-    mut archived_files: Vec<ArchivedArtifactEntry>,
+    archived_files: Vec<ArchivedArtifactEntry>,
 ) -> Result<(), AppError>
 {
-    let payload_end = archived_files.iter().try_fold(0u64, |sum, entry| {
+    let payload_end: u64 = archived_files.iter().try_fold(0_u64, |sum, entry| {
         sum.checked_add(entry.size_after_pipeline)
             .ok_or_else(|| AppError::CorruptArchive("Переполнение общего размера payload'ов".into()))
     })?;
-
-    // Детерминированный порядок таблицы не обязан совпадать с порядком записи
-    // payload'ов: payload_offset уже содержит фактическое положение данных.
-    archived_files.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
 
     let mut archive_file = OpenOptions::new()
         .read(true)
@@ -100,7 +93,7 @@ pub fn write_archive_header(
         }
 
         // Пустой файл не занимает места и не должен участвовать
-        // в проверке непрерывного покрытия payload-секции.
+        // в проверке непрерывного покрытия payload-секции:
         if start == end {
             continue;
         }

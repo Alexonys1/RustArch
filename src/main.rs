@@ -1,11 +1,5 @@
-pub mod cli;
-pub mod error;
-pub mod archiver;
-pub mod algorithms;
-//mod gui;
-
-use crate::cli::{ CLICommand, run_pack, run_unpack };
-use crate::algorithms::{ CipherId, CompressionId, FecId, PipelineSettings };
+use RustArch::cli::{ CLICommand, run_pack, run_unpack };
+use RustArch::algorithms::{ CipherId, CompressionId, FecId, PipelineSettings };
 
 
 fn main() {
@@ -35,7 +29,7 @@ fn main() {
             source_path: SOURCE_PATH.into(), // Важно, что эти относительные пути именно строки,
             target_archive_path: TARGET_ARCHIVE_PATH.into(), // которые можно менять
             settings: PipelineSettings {
-                compression: CompressionId::Huffman,
+                compression: CompressionId::Deflate,
                 cipher: CipherId::NoCipher,
                 fec: FecId::NoFec,
             },
@@ -49,7 +43,7 @@ fn main() {
         },
 
         TestCLICommand::TestGrouping => {
-            use crate::archiver::{group_files_for_workers, walk_directory_or_file, WalkedFile};
+            use RustArch::archiver::{ group_files_for_workers, walk_directory_or_file, WalkedFile };
 
             let start = std::time::Instant::now();
             let walked_files: Vec<WalkedFile> = walk_directory_or_file(SOURCE_PATH).unwrap().files;

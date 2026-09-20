@@ -1,16 +1,19 @@
-use std::borrow::Cow;
 use std::io::{self, Read, Write, Seek, SeekFrom};
 use std::fs::{self, File, OpenOptions};
 use std::sync::{Mutex, OnceLock};
 use std::path::{Path, PathBuf};
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
+use std::borrow::Cow;
 
+use crate::error::AppError;
 use crate::algorithms::PipelineSettings;
 use super::memory_budget::BudgetGuard;
 
 
-pub const DEFAULT_CHUNK_SIZE_IN_BYTES: usize = 512 * 1024; // 512KB
+pub const DEFAULT_CHUNK_SIZE_IN_BYTES: usize = 512 * 1024; // 512KB // Найдено опытным путём. Больше-меньше - хуже скорость на моей машине
+
+// TODO: Я бы мог сделать ArtifactBuilder!! Как в стандартной библиотеке для открытия файла с указанием параметров в OpenOptions!!!
 
 
 pub struct Artifact {
@@ -323,6 +326,51 @@ impl Artifact {
         }
         Ok(())
     }
+
+    // TODO: Да, это повод для макроса. Но мне лень.
+    pub fn read_le_u8(&mut self) -> Result<u8, AppError> {
+        Ok(u8::from_le_bytes(
+            self.read_n_bytes()?.try_into().unwrap()
+        ))
+    }
+
+    pub fn read_le_u16(&mut self) -> Result<u16, AppError> {
+        Ok(u16::from_le_bytes(
+            self.read_n_bytes()?.try_into().unwrap()
+        ))
+    }
+
+    pub fn read_le_u32(&mut self) -> Result<u32, AppError> {
+        Ok(u32::from_le_bytes(
+            self.read_n_bytes()?.try_into().unwrap()
+        ))
+    }
+
+    pub fn read_le_u64(&mut self) -> Result<u64, AppError> {
+        Ok(u64::from_le_bytes(
+            self.read_n_bytes()?.try_into().unwrap()
+        ))
+    }
+
+    // Несмотря на свою устрашающую сигнатуру, она делает код чище. Я удивлён
+    fn read_n_bytes<const N: usize>(&mut self) -> Result<[u8; N], AppError> {
+        let mut buffer: [u8; N] = [0; N];
+        let mut filled: usize = 0;
+
+        while filled < N {
+            let read_bytes: usize = self.read_chunk_to(&mut buffer[filled..])?;
+
+            if read_bytes == 0 {
+                return Err(AppError::CorruptArchive(
+                    "Неожиданный конец потока при чтении!".into(),
+                ));
+            }
+
+            filled += read_bytes;
+        }
+
+        Ok(buffer)
+    }
     
     /// Записывает не больше `chunk_size` байт за один вызов. Двигает курсор.
     fn write_chunk_once_from(&mut self, buf: &[u8]) -> io::Result<usize> {
@@ -392,19 +440,19 @@ impl Drop for Artifact {
                 if self.is_temp_file {
                     let path: &Path = self.file_path.as_ref();
                     let result: io::Result<()> = fs::remove_file(path);
-                    println!("The artifact [FILE] has been removed: {:?}. Path: {:?}", result, self.file_path);
+                    //println!("The artifact [FILE] has been removed: {:?}. Path: {:?}", result, self.file_path);
                 } else {
-                    println!("The artifact [FILE] has been dropped, but the file is still exists. Path: {:?}", self.file_path);
+                    //println!("The artifact [FILE] has been dropped, but the file is still exists. Path: {:?}", self.file_path);
                 }
             }
 
             ArtifactState::Memory { data, .. } => {
-                println!("The artifact [MEMORY]  has been dropped: {} bytes", data.len());
+                //println!("The artifact [MEMORY]  has been dropped: {} bytes", data.len());
                 //super::memory_budget::show_memory_bar();
             }
 
             ArtifactState::FileWindow { len, .. } => {
-                println!("The artifact [FILE WINDOW] has been dropped: {} bytes", len);
+                //println!("The artifact [FILE WINDOW] has been dropped: {} bytes", len);
             }
         }
     }

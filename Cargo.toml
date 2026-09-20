@@ -13,8 +13,8 @@ edition = "2024"
 [profile.release]
 debug = true
 opt-level = 3
-#codegen-units = 1 # Бустит скорость больше, чем на 0.5с!!
-#lto = true        # Бустит скорость больше, чем на 0.5с!!
+codegen-units = 1 # Бустит скорость больше, чем на 0.5с!!
+lto = true        # Бустит скорость больше, чем на 0.5с!!
 
 [profile.samply]
 inherits = "release"

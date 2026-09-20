@@ -1,6 +1,6 @@
 use std::fs::File;
-use std::io::{Seek, SeekFrom};
 use std::path::PathBuf;
+use std::io::{Seek, SeekFrom};
 use std::sync::mpsc::Receiver;
 use std::thread::JoinHandle;
 
@@ -18,14 +18,12 @@ pub fn create_thread_with_queue_writer(
         let mut written_entries: Vec<ArchivedArtifactEntry> = Vec::new();
 
         for (mut entry, mut artifact) in artifact_receiver.into_iter() {
-            let payload_offset = archive_file.seek(SeekFrom::End(0))?;
+            let payload_offset: u64 = archive_file.seek(SeekFrom::End(0))?;
             artifact.write_to_file_end(&mut archive_file)?;
 
             entry.payload_offset = payload_offset;
             written_entries.push(entry);
-
-            // Очень важно дропать артефакты именно в цикле, иначе новая архитектура с очередью будет написана зря:
-            drop(artifact);
+            // Для Коли: артефакт дропнется из памяти сам. Не просто же так я .into_iter() пишу.
         }
 
         archive_file.sync_all()?;

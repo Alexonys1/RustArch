@@ -5,7 +5,7 @@ use crate::algorithms::{Cipher, ErrorCorrectionCode, PipelineSettings, Compressi
 use crate::archiver::{crc32_of_artifact_and_rewind, Artifact, WalkedFile, ArchivedArtifactEntry};
 use crate::error::AppError;
 
-const IS_OPTIMIZE_ON: bool = true; // TODO:  Исправить баг!!!
+const IS_OPTIMIZE_ON: bool = true;
 
 
 /// compress -> encrypt -> fec-encode
@@ -16,7 +16,7 @@ pub fn pack_file(
     pipeline_settings: PipelineSettings,
     encode_key: &[u8],
     artifact_sender: Sender<(ArchivedArtifactEntry, Artifact)>,
-) -> Result<ArchivedArtifactEntry, AppError>
+) -> Result<(), AppError>
 {
     let mut artifact = Artifact::from_file(file.absolute_path.as_ref())?;
 
@@ -50,10 +50,10 @@ pub fn pack_file(
     };
 
     artifact_sender
-        .send((entry.clone(), cooked_artifact))
+        .send((entry, cooked_artifact))
         .map_err(|_| AppError::Compression("Очередь записи архива недоступна".into()))?;
 
-    Ok(entry)
+    Ok(())
 }
 
 

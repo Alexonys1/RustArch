@@ -35,7 +35,7 @@ pub fn unpack_file(
     let cipher: Box<dyn Cipher> = entry.pipeline.cipher.get();
     let compressor: Box<dyn Compressor> = entry.pipeline.compression.get();
 
-    let (fec_decoded_artifact, _fec_report): (Artifact, FecReport) = fec.decode(windowed_artifact)?;
+    let (fec_decoded_artifact, _fec_report) = fec.decode(windowed_artifact)?;
     let decrypted_artifact = cipher.transform(fec_decoded_artifact, decode_key)?;
     let original_artifact = compressor.decompress(decrypted_artifact)?;
 

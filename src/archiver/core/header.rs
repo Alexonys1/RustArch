@@ -54,7 +54,8 @@ pub struct ArchiveFooter {
 
 
 pub fn write_entry(file: &mut File, entry: &ArchiveEntry) -> Result<(), AppError> {
-    let path_bytes = entry.relative_path.as_bytes();
+    let path_bytes: &[u8] = entry.relative_path.as_bytes();
+
     if path_bytes.len() > u16::MAX as usize {
         return Err(AppError::CorruptArchive(format!(
             "путь слишком длинный: {} байт",
@@ -64,15 +65,24 @@ pub fn write_entry(file: &mut File, entry: &ArchiveEntry) -> Result<(), AppError
 
     file.write_all(&(path_bytes.len() as u16).to_le_bytes())?;
     file.write_all(path_bytes)?;
+
     file.write_all(&entry.original_size.to_le_bytes())?;
+
     file.write_all(&entry.stored_size.to_le_bytes())?;
+
     file.write_all(&entry.payload_offset.to_le_bytes())?;
+
     file.write_all(&[entry.entry_flags()])?;
     file.write_all(&entry.crc32.to_le_bytes())?;
+
     file.write_all(&[entry.pipeline.compression.as_u8()])?;
+
     file.write_all(&[entry.pipeline.cipher.as_u8()])?;
+
     file.write_all(&[entry.pipeline.fec.as_u8()])?;
+
     file.write_all(&0u8.to_le_bytes())?;
+
     Ok(())
 }
 

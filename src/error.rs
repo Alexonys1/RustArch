@@ -2,6 +2,12 @@ use std::fmt;
 use std::io;
 
 
+// Здесь я бы мог использовать библиотеку thiserror с макросами для
+// автоматической реализации преобразования одного типа ошибок в другие.
+// Но, во-первых, я уже всё написал.
+// И, во-вторых, сторонняя библиотека немного замедляет компиляцию.
+
+
 /// Единый тип ошибки на всё приложение. Все подсистемы (сжатие, крипто, FEC,
 /// формат архива, CLI) заворачивают свои ошибки сюда через `From`, поэтому
 /// в коде пайплайна можно свободно использовать `?` независимо от того,
@@ -40,18 +46,18 @@ pub enum AppError {
 impl fmt::Display for AppError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            AppError::Io(e) => write!(f, "ошибка ввода-вывода: {e}"),
-            AppError::CorruptArchive(msg) => write!(f, "архив повреждён: {msg}"),
-            AppError::Compression(msg) => write!(f, "ошибка сжатия: {msg}"),
-            AppError::Crypto(msg) => write!(f, "ошибка шифрования: {msg}"),
-            AppError::Fec(msg) => write!(f, "ошибка помехоустойчивого кодирования: {msg}"),
+            AppError::Io(e) => write!(f, "Ошибка ввода-вывода: {e}"),
+            AppError::CorruptArchive(msg) => write!(f, "Архив повреждён: {msg}"),
+            AppError::Compression(msg) => write!(f, "Ошибка сжатия: {msg}"),
+            AppError::Crypto(msg) => write!(f, "Ошибка шифрования: {msg}"),
+            AppError::Fec(msg) => write!(f, "Ошибка помехоустойчивого кодирования: {msg}"),
             AppError::ChecksumMismatch { path } => {
-                write!(f, "контрольная сумма не совпала для '{path}': файл повреждён или неверный ключ")
+                write!(f, "Контрольная сумма не совпала для '{path}': файл повреждён или неверный ключ")
             }
             AppError::NotImplemented(name) => {
-                write!(f, "алгоритм '{name}' ещё не реализован - это заготовка под вашу реализацию")
+                write!(f, "Алгоритм '{name}' ещё не реализован - это заготовка под вашу реализацию")
             }
-            AppError::CLIUsage(msg) => write!(f, "ошибка использования: {msg}"),
+            AppError::CLIUsage(msg) => write!(f, "Ошибка использования: {msg}"),
         }
     }
 }

@@ -11,14 +11,12 @@ use super::one_file::pack_file;
 const MAX_PARALLELISM: usize = usize::MAX;
 
 
-/// Параллельно готовит payload'ы. Фактические payload_offset назначаются
-/// единственным writer-потоком, поэтому порядок завершения worker'ов не важен.
 pub fn pack_files_parallel(
     files: Vec<WalkedFile>,
     pipeline_settings: PipelineSettings,
     encode_key: &[u8],
     artifact_sender: Sender<(ArchivedArtifactEntry, Artifact)>,
-) -> Result<Vec<ArchivedArtifactEntry>, AppError>
+) -> Result<(), AppError>
 {
     let groups_of_files = group_files_for_workers(&files, MAX_PARALLELISM)?;
 
@@ -31,15 +29,11 @@ pub fn pack_files_parallel(
             }));
         }
 
-        let mut result = Vec::with_capacity(files.len());
         for worker in workers {
-            let entries = worker
-                .join()
-                .map_err(|_| AppError::Compression("Паника в рабочем потоке".into()))??;
-            result.extend(entries);
+            worker.join().map_err(|_| AppError::Compression("Паника в рабочем потоке".into()))??;
         }
 
-        Ok(result)
+        Ok(())
     })
 }
 
@@ -49,14 +43,12 @@ fn start_packing_file_group(
     pipeline_settings: PipelineSettings,
     encode_key: &[u8],
     artifact_sender: Sender<(ArchivedArtifactEntry, Artifact)>,
-) -> Result<Vec<ArchivedArtifactEntry>, AppError> {
-    let mut result = Vec::with_capacity(file_group.len());
-
+) -> Result<(), AppError> {
     for &file in file_group {
-        result.push(pack_file(file, pipeline_settings, encode_key, artifact_sender.clone())?);
+        pack_file(file, pipeline_settings, encode_key, artifact_sender.clone())?
     }
 
-    Ok(result)
+    Ok(())
 }
 
 
