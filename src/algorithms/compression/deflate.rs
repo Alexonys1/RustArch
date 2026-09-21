@@ -1,26 +1,24 @@
 use super::{HuffmanCompressor, LzssCompressor};
 use super::{CompressionId, Compressor};
-use super::Lz77Compressor;
 use crate::archiver::Artifact;
 use crate::error::AppError;
 
 
-/// Deflate-подобная схема: не переизобретает LZ77 и Хаффмана, а просто
-/// прогоняет данные через уже готовые реализации по очереди.
+/// Составная схема LZSS + byte-wise Huffman. Это намеренно не заявляется
+/// как совместимый с RFC 1951 поток: настоящий DEFLATE кодирует литералы,
+/// длины и расстояния общей битовой грамматикой, а не сжимает байтовое
+/// представление LZSS вторым независимым этапом.
 ///
-/// compress:   исходные данные -> LZ77 -> поток токенов -> Huffman -> архив
-/// decompress: архив -> Huffman -> поток токенов LZ77 -> LZ77 -> исходные данные
-///
-/// LZ77 убирает повторы (пары/фразы), а Хаффман затем сжимает получившийся
-/// поток токенов за счёт неравномерного распределения байт в нём (именно
-/// так устроен настоящий DEFLATE: LZSS + Хаффман-кодирование результата).
+/// Huffman здесь нельзя самовольно пропустить даже при невыгодном результате:
+/// декодер всегда выполняет оба этапа, а отдельного признака bypass в формате
+/// нет. Поэтому используется `compress_always`.
 pub struct DeflateCompressor;
 
 
 impl Compressor for DeflateCompressor {
     fn compress(&self, artifact: Artifact) -> Result<Artifact, AppError> {
         let lzss_stage = LzssCompressor.compress(artifact)?;
-        let huffman_stage = HuffmanCompressor.compress(lzss_stage)?;
+        let huffman_stage = HuffmanCompressor.compress_always(lzss_stage)?;
         Ok(huffman_stage)
     }
 

@@ -19,7 +19,7 @@ fn main() {
 
     enum TestCLICommand { Pack, Unpack, TestGrouping }
     let test_choice = TestCLICommand::Pack; // !МЕНЯТЬ ЗДЕСЬ!   <==========================
-    const SOURCE_PATH:         &str = r"C:\Games\Battlefield 2142 Novgames RST";
+    const SOURCE_PATH:         &str = r"C:\Users\alex\Desktop\Тестовые данные для архиватора\Смешанное\Фото + Текст";
     const TARGET_ARCHIVE_PATH: &str = r".\test_data_for_removing\study.arch";
     const UNPACK_PATH:         &str = r".\test_data_for_removing\unpacked";
 
@@ -86,9 +86,8 @@ fn main() {
     };
     let elapsed = start.elapsed();
 
-    use std::os::windows::fs::MetadataExt;
     let archive_size_in_gb: f64 = std::fs::metadata(r"C:\Users\alex\RustroverProjects\RustArch\test_data_for_removing\study.arch")
-        .unwrap().file_size() as f64 / 1024_f64.powi(3);
+        .unwrap().len() as f64 / 1024_f64.powi(3);
 
     println!("\n===> TOTAL TIME: {}ms", elapsed.as_millis());
     println!(  "===> TOTAL SIZE: {:.2}GB", archive_size_in_gb);

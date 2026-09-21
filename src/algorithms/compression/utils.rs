@@ -8,14 +8,9 @@ use crate::archiver::memory_budget::BudgetGuard; // поправьте путь 
 // SlidingWindow — ограниченный по памяти буфер входных данных
 // ---------------------------------------------------------------------
 
-/// Насколько буферу позволяется вырасти, прежде чем сработает подрезка
-/// спереди. Взято с запасом (x3 от WINDOW_SIZE), чтобы подрезка происходила
-/// не на каждый байт, а раз в WINDOW_SIZE*2 обработанных байт - тогда
-/// суммарная стоимость подрезок амортизируется до O(1) на байт, а не
-/// становится квадратичной.
-fn slide_trigger(window_size: usize) -> usize {
-    window_size * 3
-}
+/// Читаем вход сравнительно крупными блоками, но не позволяем размеру
+/// `Artifact::chunk_size` (по умолчанию 512 КиБ) раздувать окно.
+const INPUT_READ_SIZE: usize = 64 * 1024;
 
 /// Держит в памяти ТОЛЬКО то, что реально может понадобиться алгоритму:
 /// до `window_size` байт уже пройденной "истории" позади текущей позиции
@@ -28,24 +23,27 @@ fn slide_trigger(window_size: usize) -> usize {
 /// и какое-то количество байт упреждающего просмотра впереди. Размер
 /// буфера НЕ зависит от размера обрабатываемого файла.
 ///
-/// Хранилище - обычный непрерывный `Vec<u8>` (а не `VecDeque`): подрезка
-/// спереди (`trim_if_needed`) обходится так же амортизированно дёшево
-/// (`drain` пачкой, а не поэлементно), но непрерывность памяти даёт
-/// главное - `slice_from()` возвращает настоящий срез `&[u8]`, который
-/// можно сравнивать блоками по 8 байт в `common_prefix_len`, а не только
-/// по одному байту, как было бы с кольцевым буфером `VecDeque`.
+/// Хранилище — непрерывный `Vec<u8>` (не `VecDeque`). Оно компактируется
+/// через `copy_within` только перед refill, поэтому `slice_from()` всегда
+/// возвращает настоящий срез `&[u8]` для 8-байтового сравнения.
 pub struct SlidingWindow {
     buffer: Vec<u8>,
     /// Абсолютная позиция в потоке, которой соответствует buffer[0].
     base_pos: u64,
     exhausted: bool,
     window_size: usize,
+    capacity: usize,
     _guard: BudgetGuard,
 }
 
 impl SlidingWindow {
     pub fn new(window_size: usize, lookahead_size: usize) -> Result<Self, AppError> {
-        let capacity = slide_trigger(window_size) + lookahead_size;
+        let capacity = window_size
+            .checked_add(INPUT_READ_SIZE)
+            .and_then(|v| v.checked_add(lookahead_size))
+            .ok_or_else(|| AppError::Compression(
+                "LZ: переполнение при вычислении размера скользящего окна".into(),
+            ))?;
         let mut guard = BudgetGuard::default();
         if !guard.try_grow(capacity as i64) {
             return Err(AppError::Compression(format!(
@@ -57,18 +55,47 @@ impl SlidingWindow {
             base_pos: 0,
             exhausted: false,
             window_size,
+            capacity,
             _guard: guard,
         })
     }
 
     pub fn ensure_available(&mut self, artifact: &mut Artifact, pos: u64, want: usize) -> io::Result<()> {
+        if self.available_after(pos) < want && !self.exhausted {
+            self.compact_for(pos);
+        }
+
         while !self.exhausted && self.available_after(pos) < want {
-            match artifact.next_chunk()? {
-                Some(chunk) => self.buffer.extend_from_slice(&chunk),
-                None => self.exhausted = true,
+            let free = self.capacity.saturating_sub(self.buffer.len());
+            if free == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "LZ: недостаточная ёмкость скользящего окна",
+                ));
+            }
+
+            let to_read = free.min(INPUT_READ_SIZE);
+            let old_len = self.buffer.len();
+            self.buffer.resize(old_len + to_read, 0);
+            let read = artifact.read_chunk_to(&mut self.buffer[old_len..])?;
+            self.buffer.truncate(old_len + read);
+            if read == 0 {
+                self.exhausted = true;
             }
         }
         Ok(())
+    }
+
+    fn compact_for(&mut self, pos: u64) {
+        let keep_from = pos.saturating_sub(self.window_size as u64);
+        if keep_from <= self.base_pos {
+            return;
+        }
+
+        let drop_count = (keep_from - self.base_pos) as usize;
+        self.buffer.copy_within(drop_count.., 0);
+        self.buffer.truncate(self.buffer.len() - drop_count);
+        self.base_pos = keep_from;
     }
 
     pub fn available_after(&self, pos: u64) -> usize {
@@ -89,13 +116,9 @@ impl SlidingWindow {
     }
 
     pub fn trim_if_needed(&mut self, pos: u64) {
-        let local = (pos - self.base_pos) as usize;
-        let trigger = slide_trigger(self.window_size);
-        if local > trigger {
-            let drop_count = local - self.window_size;
-            self.buffer.drain(0..drop_count); // пачкой, не по одному элементу
-            self.base_pos += drop_count as u64;
-        }
+        // Не двигаем память на горячем пути каждого токена. История
+        // компактируется один раз непосредственно перед refill.
+        debug_assert!(pos >= self.base_pos);
     }
 }
 
@@ -200,14 +223,12 @@ fn common_prefix_len(a: &[u8], b: &[u8], max_len: usize) -> usize {
     let mut len = 0;
 
     while len + 8 <= limit {
-        let wa = u64::from_ne_bytes(a[len..len + 8].try_into().unwrap());
-        let wb = u64::from_ne_bytes(b[len..len + 8].try_into().unwrap());
+        let wa = u64::from_le_bytes(a[len..len + 8].try_into().unwrap());
+        let wb = u64::from_le_bytes(b[len..len + 8].try_into().unwrap());
         let diff = wa ^ wb;
         if diff != 0 {
-            // trailing_zeros/8 - номер первого несовпадающего байта внутри
-            // слова. Корректно для little-endian (x86_64/ARM); для
-            // переносимости на big-endian здесь нужна была бы отдельная
-            // ветка с leading_zeros.
+            // Благодаря from_le_bytes trailing_zeros/8 — номер первого
+            // несовпадающего байта на любой endian-архитектуре.
             return len + (diff.trailing_zeros() / 8) as usize;
         }
         len += 8;
@@ -226,6 +247,7 @@ fn common_prefix_len(a: &[u8], b: &[u8], max_len: usize) -> usize {
 /// кандидатов почти никогда не окупается: выигрыш в сжатии исчезающе мал
 /// по сравнению со стоимостью полного прохода по цепочке.
 const NICE_MATCH_LEN: usize = 128;
+const GOOD_MATCH_LEN: usize = 32;
 
 /// Ищет самое длинное совпадение для данных, начинающихся в `pos`.
 /// Возвращает (offset, length); (0, 0), если совпадения длиной
@@ -245,15 +267,50 @@ pub fn find_longest_match(
     }
 
     let window_start = pos.saturating_sub(window_size);
+    let current = window.slice_from(pos);
     let mut best_len = 0usize;
     let mut best_offset = 0usize;
+
+    // Самый частый случай на низкоэнтропийных данных — серия одного
+    // байта. Для offset=1 длинное совпадение можно принять без обхода
+    // хэш-цепочки.
+    if pos > window_start && window.byte_at(pos - 1) == current[0] {
+        let len = common_prefix_len(window.slice_from(pos - 1), current, max_len);
+        if len >= min_match_len {
+            best_len = len;
+            best_offset = 1;
+            if len >= NICE_MATCH_LEN || len == max_len {
+                return (best_offset, best_len);
+            }
+        }
+    }
 
     for (checked, cand_pos) in chain.candidates(window, pos, window_start).enumerate() {
         if checked >= max_chain_len {
             break;
         }
 
-        let len = common_prefix_len(window.slice_from(cand_pos), window.slice_from(pos), max_len);
+        // Аналог good_match из zlib: после хорошего совпадения оставляем
+        // только четверть исходного бюджета цепочки.
+        if best_len >= GOOD_MATCH_LEN && checked >= max_chain_len.div_ceil(4) {
+            break;
+        }
+        if cand_pos >= pos || (best_offset == 1 && cand_pos + 1 == pos) {
+            continue;
+        }
+
+        let candidate = window.slice_from(cand_pos);
+        // Отбрасываем коллизии 16-битного хэша и кандидаты, которые уже
+        // не могут улучшить найденную длину.
+        if candidate[0] != current[0]
+            || candidate[1] != current[1]
+            || candidate[2] != current[2]
+            || (best_len > 0 && candidate[best_len] != current[best_len])
+        {
+            continue;
+        }
+
+        let len = common_prefix_len(candidate, current, max_len);
 
         if len > best_len {
             best_len = len;
@@ -282,35 +339,135 @@ pub struct BufferedArtifactReader<'a> {
     artifact: &'a mut Artifact,
     buf: Vec<u8>,
     pos: usize,
+    end: usize,
 }
 
 impl<'a> BufferedArtifactReader<'a> {
     pub fn new(artifact: &'a mut Artifact) -> Self {
-        Self { artifact, buf: Vec::new(), pos: 0 }
+        Self {
+            artifact,
+            buf: vec![0; INPUT_READ_SIZE],
+            pos: 0,
+            end: 0,
+        }
     }
 
-    pub fn read_exact(&mut self, n: usize) -> Result<Vec<u8>, AppError> {
-        while self.buf.len() - self.pos < n {
+    fn fill(&mut self, need: usize) -> Result<(), AppError> {
+        while self.end - self.pos < need {
             if self.pos > 0 {
-                self.buf.drain(0..self.pos);
+                self.buf.copy_within(self.pos..self.end, 0);
+                self.end -= self.pos;
                 self.pos = 0;
             }
-            match self.artifact.next_chunk()? {
-                Some(chunk) => self.buf.extend_from_slice(&chunk),
-                None => {
-                    return Err(AppError::CorruptArchive(
-                        "LZSS: неожиданный конец потока при чтении токена".to_string(),
-                    ))
-                }
+
+            let missing = need - (self.end - self.pos);
+            if self.buf.len() - self.end < missing {
+                self.buf.resize((self.end + missing).max(INPUT_READ_SIZE), 0);
             }
+
+            let read = self.artifact.read_chunk_to(&mut self.buf[self.end..])?;
+            if read == 0 {
+                return Err(AppError::CorruptArchive(
+                    "LZ: неожиданный конец потока при чтении токена".to_string(),
+                ));
+            }
+            self.end += read;
         }
-        let result = self.buf[self.pos..self.pos + n].to_vec();
-        self.pos += n;
-        Ok(result)
+        Ok(())
     }
 
     pub fn read_u8(&mut self) -> Result<u8, AppError> {
-        Ok(self.read_exact(1)?[0])
+        self.fill(1)?;
+        let value = self.buf[self.pos];
+        self.pos += 1;
+        Ok(value)
+    }
+
+    pub fn read_u16_le(&mut self) -> Result<u16, AppError> {
+        self.fill(2)?;
+        let value = u16::from_le_bytes([self.buf[self.pos], self.buf[self.pos + 1]]);
+        self.pos += 2;
+        Ok(value)
+    }
+
+    pub fn read_u64_le(&mut self) -> Result<u64, AppError> {
+        self.fill(8)?;
+        let value = u64::from_le_bytes(self.buf[self.pos..self.pos + 8].try_into().unwrap());
+        self.pos += 8;
+        Ok(value)
+    }
+
+    /// Добавляет ровно `n` байт в существующий выходной буфер без
+    /// промежуточного Vec и без аллокации на каждый литеральный блок.
+    pub fn append_exact(&mut self, mut n: usize, out: &mut Vec<u8>) -> Result<(), AppError> {
+        out.reserve(n);
+        while n > 0 {
+            if self.pos == self.end {
+                self.fill(1)?;
+            }
+            let take = n.min(self.end - self.pos);
+            out.extend_from_slice(&self.buf[self.pos..self.pos + take]);
+            self.pos += take;
+            n -= take;
+        }
+        Ok(())
+    }
+}
+
+
+/// Фиксированное кольцевое окно декодера. В отличие от VecDeque не
+/// выполняет pop_front для каждого байта.
+pub struct DecodeHistory {
+    data: Vec<u8>,
+    write: usize,
+    len: usize,
+}
+
+impl DecodeHistory {
+    pub fn new(capacity: usize) -> Self {
+        assert!(capacity > 0);
+        Self { data: vec![0; capacity], write: 0, len: 0 }
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn push(&mut self, byte: u8) {
+        self.data[self.write] = byte;
+        self.write += 1;
+        if self.write == self.data.len() {
+            self.write = 0;
+        }
+        self.len = (self.len + 1).min(self.data.len());
+    }
+
+    pub fn extend(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.push(byte);
+        }
+    }
+
+    pub fn copy_match(
+        &mut self,
+        offset: usize,
+        length: usize,
+        out: &mut Vec<u8>,
+    ) -> Result<(), AppError> {
+        if offset == 0 || offset > self.len {
+            return Err(AppError::CorruptArchive(
+                "LZ: некорректный offset ссылки назад".to_string(),
+            ));
+        }
+
+        out.reserve(length);
+        for _ in 0..length {
+            let index = (self.write + self.data.len() - offset) % self.data.len();
+            let byte = self.data[index];
+            self.push(byte);
+            out.push(byte);
+        }
+        Ok(())
     }
 }
 

@@ -1,6 +1,7 @@
-use std::collections::VecDeque;
-
-use crate::algorithms::compression::utils::{BufferedArtifactReader, HashChain, SlidingWindow, find_longest_match, flush_if_needed};
+use crate::algorithms::compression::utils::{
+    find_longest_match, flush_if_needed, BufferedArtifactReader, DecodeHistory, HashChain,
+    SlidingWindow,
+};
 use crate::algorithms::compression::{CompressionId, Compressor};
 use crate::archiver::Artifact;
 use crate::error::AppError;
@@ -90,7 +91,15 @@ impl Compressor for Lz77Compressor {
             // совпадениям начинаться внутри уже закодированного участка.
             // Как и в LZSS, вставляем только если под позицией реально
             // есть 3 байта для хэша - на самом конце файла это не так.
-            let advance = if length > 0 { length as u64 } else { 1 };
+            // LZ77-токен с match поглощает и следующий литерал. Его тоже
+            // нужно индексировать, иначе следующая позиция теряет самый
+            // свежий возможный кандидат.
+            let has_next_literal = length > 0 && available > length;
+            let advance = if length > 0 {
+                length as u64 + has_next_literal as u64
+            } else {
+                1
+            };
             let end = (pos + advance).min(pos + available as u64);
             for i in pos..end {
                 if window.available_after(i) >= 3 {
@@ -130,11 +139,11 @@ impl Compressor for Lz77Compressor {
         // Буферизованное чтение токенов вместо read_chunk_to по 1-2 байта
         // напрямую из Artifact - см. подробности в lzss.rs.
         let mut reader = BufferedArtifactReader::new(&mut artifact);
-        let original_size = u64::from_le_bytes(reader.read_exact(8)?.try_into().unwrap());
+        let original_size = reader.read_u64_le()?;
 
         // Окно последних WINDOW_SIZE выведенных байт вместо накопления
         // всего `decoded: Vec<u8>` размером с файл.
-        let mut window: VecDeque<u8> = VecDeque::with_capacity(WINDOW_SIZE);
+        let mut window = DecodeHistory::new(WINDOW_SIZE);
         let mut out_buf: Vec<u8> = Vec::with_capacity(OUTPUT_FLUSH_SIZE);
         let mut produced: u64 = 0;
 
@@ -144,37 +153,30 @@ impl Compressor for Lz77Compressor {
             match tag {
                 TAG_LITERAL => {
                     let literal = reader.read_u8()?;
-                    window.push_back(literal);
+                    window.push(literal);
                     out_buf.push(literal);
                     produced += 1;
                 }
                 TAG_MATCH_WITH_LITERAL | TAG_MATCH_AT_EOF => {
-                    let offset = u16::from_le_bytes(reader.read_exact(2)?.try_into().unwrap()) as usize;
+                    let offset = reader.read_u16_le()? as usize;
                     let length = reader.read_u8()? as usize;
 
-                    if offset == 0 || offset > window.len() {
+                    let extra_literal = (tag == TAG_MATCH_WITH_LITERAL) as usize;
+                    if offset == 0
+                        || offset > window.len()
+                        || length == 0
+                        || length as u64 + extra_literal as u64 > original_size - produced
+                    {
                         return Err(AppError::CorruptArchive(
-                            "LZ77: Некорректный offset ссылки назад".to_string(),
+                            "LZ77: некорректная ссылка назад".to_string(),
                         ));
                     }
-
-                    // `start` фиксируется ДО копирования; подрезка окна
-                    // (pop_front) делается ПОСЛЕ полной обработки токена
-                    // (включая литерал, если он есть) - иначе индексы
-                    // съехали бы при самоссылающихся совпадениях
-                    // (offset < length) или при обрезке ровно посреди
-                    // копирования.
-                    let start = window.len() - offset;
-                    for i in 0..length {
-                        let byte = window[start + i];
-                        window.push_back(byte);
-                        out_buf.push(byte);
-                    }
+                    window.copy_match(offset, length, &mut out_buf)?;
                     produced += length as u64;
 
                     if tag == TAG_MATCH_WITH_LITERAL {
                         let literal = reader.read_u8()?;
-                        window.push_back(literal);
+                        window.push(literal);
                         out_buf.push(literal);
                         produced += 1;
                     }
@@ -184,10 +186,6 @@ impl Compressor for Lz77Compressor {
                         "LZ77: Неизвестный тег токена: {other}"
                     )));
                 }
-            }
-
-            while window.len() > WINDOW_SIZE {
-                window.pop_front();
             }
 
             if out_buf.len() >= OUTPUT_FLUSH_SIZE {

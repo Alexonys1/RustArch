@@ -1,7 +1,9 @@
 use crate::error::AppError;
 use crate::archiver::Artifact;
 use crate::algorithms::compression::{CompressionId, Compressor};
-use crate::algorithms::compression::utils::{find_longest_match, HashChain, SlidingWindow, BufferedArtifactReader};
+use crate::algorithms::compression::utils::{
+    find_longest_match, BufferedArtifactReader, DecodeHistory, HashChain, SlidingWindow,
+};
 
 
 /// Минимальная длина совпадения, при которой выгодно ссылаться на прошлое
@@ -11,7 +13,7 @@ use crate::algorithms::compression::utils::{find_longest_match, HashChain, Slidi
 /// При длине 3 совпадение (3 + 1/8 байта) уже дешевле трёх литералов
 /// (3 * (1 + 1/8) байта).
 const MIN_MATCH_LEN: usize = 3;
-const MAX_CHAIN_LEN: usize = 255;
+const MAX_CHAIN_LEN: usize = 125;
 const MAX_OFFSET: usize = u16::MAX as usize;
 
 /// Байт длины хранит НЕ саму длину совпадения, а `length - MIN_MATCH_LEN`
@@ -57,14 +59,20 @@ const OUTPUT_FLUSH_SIZE: usize = 512 * 1024;
 /// совпадений - см. подробное объяснение в предыдущей версии файла.
 const MAX_LAZY_MATCH_LEN: usize = 32;
 
+/// Для длинного совпадения индексируем только его хвост. Следующая
+/// позиция разбора всё равно получает самые свежие кандидаты, а сотни
+/// записей в hash-chain на каждый 258-байтовый match исчезают. Для
+/// коротких совпадений сохраняем полную индексацию ради степени сжатия.
+const FULL_INSERT_MATCH_LEN: usize = 32;
+const TAIL_INSERTIONS: usize = 8;
+
 /// Размер "первого блока", на котором проверяется, окупается ли сжатие
-/// вообще (см. `INCOMPRESSIBLE_RATIO_THRESHOLD`). Равен `WINDOW_SIZE` НЕ
-/// случайно: `SlidingWindow::trim_if_needed` подрезает историю только
-/// после того, как пройденная дистанция превысит `window_size * 3` (см.
-/// `slide_trigger` в utils.rs), поэтому пока пробная позиция не вышла за
-/// пределы одного окна, все прочитанные для пробы байты гарантированно
-/// ещё живы в буфере - и мы можем взять их оттуда напрямую для режима
-/// "сохранить как есть", не читая файл заново.
+/// вообще (см. `INCOMPRESSIBLE_RATIO_THRESHOLD`). Равен `WINDOW_SIZE`:
+/// пока пробная позиция не вышла за его пределы, все прочитанные для пробы
+/// байты гарантированно ещё живы в буфере и доступны для режима
+/// "сохранить как есть", не читая файл заново. Новый `SlidingWindow`
+/// компактируется только перед следующим refill; первый read-блок больше
+/// этого sample, поэтому `base_pos` здесь всё ещё равен нулю.
 const SAMPLE_BLOCK_SIZE: usize = WINDOW_SIZE;
 
 /// Если сжатый пробный блок занимает НЕ МЕНЬШЕ этой доли от размера самого
@@ -349,7 +357,7 @@ impl Compressor for LzssCompressor {
 
         let mut reader = BufferedArtifactReader::new(&mut artifact);
         let mode = reader.read_u8()?;
-        let original_size = u64::from_le_bytes(reader.read_exact(8)?.try_into().unwrap());
+        let original_size = reader.read_u64_le()?;
 
         if mode == MODE_STORED {
             // Файл был сохранён как есть - копируем оставшиеся байты без
@@ -357,9 +365,11 @@ impl Compressor for LzssCompressor {
             // напрямую): часть данных уже могла осесть в его внутреннем
             // буфере при чтении заголовка, и должна попасть в вывод.
             let mut copied: u64 = 0;
+            let mut chunk = Vec::with_capacity(OUTPUT_FLUSH_SIZE);
             while copied < original_size {
-                let want = OUTPUT_FLUSH_SIZE.min((original_size - copied) as usize);
-                let chunk = reader.read_exact(want)?;
+                let want = (original_size - copied).min(OUTPUT_FLUSH_SIZE as u64) as usize;
+                chunk.clear();
+                reader.append_exact(want, &mut chunk)?;
                 output.write_chunk_from(&chunk)?;
                 copied += want as u64;
             }
@@ -370,7 +380,7 @@ impl Compressor for LzssCompressor {
             return Err(AppError::CorruptArchive(format!("LZSS: неизвестный режим потока: {mode}")));
         }
 
-        let mut window: std::collections::VecDeque<u8> = std::collections::VecDeque::with_capacity(WINDOW_SIZE);
+        let mut window = DecodeHistory::new(WINDOW_SIZE);
         let mut out_buf: Vec<u8> = Vec::with_capacity(OUTPUT_FLUSH_SIZE);
         let mut produced: u64 = 0;
 
@@ -388,53 +398,41 @@ impl Compressor for LzssCompressor {
                 let is_match = (flags >> bit_idx) & 1 == 1;
 
                 if is_match {
-                    let offset = u16::from_le_bytes(reader.read_exact(2)?.try_into().unwrap()) as usize;
+                    let offset = reader.read_u16_le()? as usize;
 
                     if offset == 0 {
                         // Литеральная последовательность (см.
                         // `TokenGroupWriter::push_literal_run`) - никакой
                         // отдельной пометки на каждый байт, просто длина
                         // и сами байты подряд.
-                        let run_len = u16::from_le_bytes(reader.read_exact(2)?.try_into().unwrap()) as usize;
-                        let bytes = reader.read_exact(run_len)?;
-                        for byte in bytes {
-                            window.push_back(byte);
-                            out_buf.push(byte);
+                        let run_len = reader.read_u16_le()? as usize;
+                        if run_len == 0 || run_len as u64 > original_size - produced {
+                            return Err(AppError::CorruptArchive(
+                                "LZSS: некорректная длина литерального блока".to_string(),
+                            ));
                         }
+                        let start = out_buf.len();
+                        reader.append_exact(run_len, &mut out_buf)?;
+                        window.extend(&out_buf[start..]);
                         produced += run_len as u64;
                     } else {
                         // "+ MIN_MATCH_LEN" - обратное преобразование к тому,
                         // что делает `TokenGroupWriter::push_match` при записи.
                         let length = reader.read_u8()? as usize + MIN_MATCH_LEN;
 
-                        if offset > window.len() {
+                        if offset > window.len() || length as u64 > original_size - produced {
                             return Err(AppError::CorruptArchive(
-                                "LZSS: Некорректный offset ссылки назад".to_string(),
+                                "LZSS: некорректная ссылка назад".to_string(),
                             ));
                         }
-
-                        // start фиксируется ДО копирования; подрезка окна -
-                        // после полной обработки токена (см. комментарий ниже).
-                        let start = window.len() - offset;
-                        for i in 0..length {
-                            let byte = window[start + i];
-                            window.push_back(byte);
-                            out_buf.push(byte);
-                        }
+                        window.copy_match(offset, length, &mut out_buf)?;
                         produced += length as u64;
                     }
                 } else {
                     let literal = reader.read_u8()?;
-                    window.push_back(literal);
+                    window.push(literal);
                     out_buf.push(literal);
                     produced += 1;
-                }
-
-                // Подрезаем окно ПОСЛЕ токена целиком - не в процессе
-                // копирования, иначе индексы съехали бы при
-                // самоссылающихся совпадениях (offset < length).
-                while window.len() > WINDOW_SIZE {
-                    window.pop_front();
                 }
 
                 if out_buf.len() >= OUTPUT_FLUSH_SIZE {
@@ -479,7 +477,8 @@ fn compress_step(
     pending_literals: &mut Vec<u8>,
     out_buf: &mut Vec<u8>,
     pos: u64,
-) -> Result<Option<u64>, AppError> {
+) -> Result<Option<u64>, AppError>
+{
     window.ensure_available(artifact, pos, LOOKAHEAD_SIZE + 2)?;
     let available = window.available_after(pos);
     if available == 0 {
@@ -519,7 +518,12 @@ fn compress_step(
 
         group.push_match(offset, length, out_buf);
 
-        for i in 1..length {
+        let first_to_insert = if length <= FULL_INSERT_MATCH_LEN {
+            1
+        } else {
+            length.saturating_sub(TAIL_INSERTIONS)
+        };
+        for i in first_to_insert..length {
             let p = pos + i as u64;
             if window.available_after(p) >= 3 {
                 chain.insert(window, p);
