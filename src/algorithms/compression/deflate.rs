@@ -16,10 +16,11 @@ pub struct DeflateCompressor;
 
 
 impl Compressor for DeflateCompressor {
-    fn compress(&self, artifact: Artifact) -> Result<Artifact, AppError> {
-        let lzss_stage = LzssCompressor.compress(artifact)?;
+    fn compress(&self, artifact: Artifact) -> Result<(Artifact, CompressionId), AppError> {
+        let (lzss_stage, _) = LzssCompressor.compress(artifact)?;
         let huffman_stage = HuffmanCompressor.compress_always(lzss_stage)?;
-        Ok(huffman_stage)
+        
+        Ok((huffman_stage, CompressionId::Deflate))
     }
 
     fn decompress(&self, artifact: Artifact) -> Result<Artifact, AppError> {

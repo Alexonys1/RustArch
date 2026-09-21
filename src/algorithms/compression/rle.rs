@@ -7,7 +7,7 @@ pub struct RleCompressor;
 
 
 impl Compressor for RleCompressor {
-    fn compress(&self, mut artifact: Artifact) -> Result<Artifact, AppError> {
+    fn compress(&self, mut artifact: Artifact) -> Result<(Artifact, CompressionId), AppError> {
         let mut output = Artifact::new_with_temp_file_suffix(&artifact, "compressed");
         let mut current_byte: Option<u8> = None;
         let mut current_count: u32 = 0;
@@ -48,7 +48,7 @@ impl Compressor for RleCompressor {
             output.write_chunk_from(&out_buf)?;
         }
 
-        Ok(output)
+        Ok((output, CompressionId::RLE))
     }
 
     fn decompress(&self, mut artifact: Artifact) -> Result<Artifact, AppError> {

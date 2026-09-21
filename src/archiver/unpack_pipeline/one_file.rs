@@ -1,19 +1,20 @@
 use std::path::Path;
 
-use crate::algorithms::fec::FecReport;
 use crate::algorithms::{Cipher, Compressor, ErrorCorrectionCode};
 use crate::archiver::{Artifact, ArchiveEntry, crc32_of_artifact_and_rewind, resolve_output_path};
 use crate::error::AppError;
 
+
 /// fec-decode -> decrypt -> decompress.
 /// Pipeline берётся из самой записи: разные файлы одного архива могут
-/// использовать разные effective-compression после fallback.
+/// использовать разные алгоритмы сжатия.
 pub fn unpack_file(
     entry: &ArchiveEntry,
     archive_path: &Path,
     output_dir: &Path,
     decode_key: &[u8],
-) -> Result<(), AppError> {
+) -> Result<(), AppError>
+{
     let output_path = resolve_output_path(output_dir, &entry.relative_path)?;
 
     if entry.is_directory {

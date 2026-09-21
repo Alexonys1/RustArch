@@ -18,7 +18,7 @@ use super::ids::CompressionId;
 pub trait Compressor {
     /// Читает `artifact` от текущей позиции чтения до конца, отдаёт
     /// новый артефакт со сжатыми данными.
-    fn compress(&self, artifact: Artifact) -> Result<Artifact, AppError>;
+    fn compress(&self, artifact: Artifact) -> Result<(Artifact, CompressionId), AppError>;
 
     /// Читает `artifact` от текущей позиции чтения до конца, отдаёт
     /// новый артефакт со разжатыми данными.
@@ -31,8 +31,8 @@ pub struct NoneCompressor;
 
 
 impl Compressor for NoneCompressor {
-    fn compress(&self, artifact: Artifact) -> Result<Artifact, AppError> {
-        Ok(artifact)
+    fn compress(&self, artifact: Artifact) -> Result<(Artifact, CompressionId), AppError> {
+        Ok((artifact, CompressionId::NoCompression))
     }
 
     fn decompress(&self, artifact: Artifact) -> Result<Artifact, AppError> {

@@ -44,7 +44,7 @@ fn start_packing_file_group(
     encode_key: &[u8],
     artifact_sender: Sender<(ArchivedArtifactEntry, Artifact)>,
 ) -> Result<(), AppError> {
-    for &file in file_group {
+    for file in file_group {
         pack_file(file, pipeline_settings, encode_key, artifact_sender.clone())?
     }
 

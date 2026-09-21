@@ -42,7 +42,7 @@ pub struct Lz77Compressor;
 
 
 impl Compressor for Lz77Compressor {
-    fn compress(&self, mut artifact: Artifact) -> Result<Artifact, AppError> {
+    fn compress(&self, mut artifact: Artifact) -> Result<(Artifact, CompressionId), AppError> {
         if WINDOW_SIZE == 0 || WINDOW_SIZE > MAX_OFFSET {
             return Err(AppError::Compression(format!(
                 "LZ77: window_size={} вне допустимого диапазона 1..={} (формат хранит offset в 2 байтах)",
@@ -130,7 +130,7 @@ impl Compressor for Lz77Compressor {
             output.write_chunk_from(&out_buf)?;
         }
 
-        Ok(output)
+        Ok((output, CompressionId::LZ77))
     }
 
     fn decompress(&self, mut artifact: Artifact) -> Result<Artifact, AppError> {

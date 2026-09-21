@@ -2,117 +2,30 @@ use crate::error::AppError;
 use crate::archiver::Artifact;
 use crate::algorithms::compression::{CompressionId, Compressor};
 use crate::algorithms::compression::utils::{
-    find_longest_match, BufferedArtifactReader, DecodeHistory, HashChain, SlidingWindow,
+    BufferedArtifactReader, DecodeHistory, HashChain, SlidingWindow, find_longest_match,
 };
 
 
-/// Минимальная длина совпадения, при которой выгодно ссылаться на прошлое
-/// вхождение вместо того, чтобы просто записать литерал. Тело совпадения -
-/// 3 байта (offset:u16 + length:u8), тело литерала - 1 байт; оба несут ещё
-/// амортизированно ~1/8 байта на бит флага группы (см. `GROUP_SIZE`).
-/// При длине 3 совпадение (3 + 1/8 байта) уже дешевле трёх литералов
-/// (3 * (1 + 1/8) байта).
 const MIN_MATCH_LEN: usize = 3;
 const MAX_CHAIN_LEN: usize = 125;
 const MAX_OFFSET: usize = u16::MAX as usize;
-
-/// Байт длины хранит НЕ саму длину совпадения, а `length - MIN_MATCH_LEN`
-/// (см. `TokenGroupWriter::push_match`) - ведь длина короче MIN_MATCH_LEN
-/// в токен-совпадение попасть не может по построению, так что эти
-/// значения были бы потрачены впустую. Тот же приём, которым в настоящем
-/// DEFLATE длины 3..=258 кодируются через таблицу длин с "лишними" битами:
-/// там тоже физически нет значения "длина 0, 1 или 2" у кода совпадения.
-/// Смещение на MIN_MATCH_LEN при тех же 8 битах поля увеличивает
-/// максимальную длину совпадения с 255 (как было) до 258 - ровно то
-/// значение, которое использует zip/DEFLATE.
-const MAX_LENGTH: usize = u8::MAX as usize + MIN_MATCH_LEN;
-
-/// Сколько токенов покрывает один флаг-байт. Бит `i` флаг-байта: 1 -
-/// совпадение (или литеральная последовательность - см.
-/// `TokenGroupWriter::push_literal_run`), 0 - одиночный литерал. Тела
-/// токенов идут сразу после флаг-байта подряд, без собственных тегов -
-/// это убирает 100%-й оверхед старого формата "[tag, literal]" на каждый
-/// литерал: раньше литерал стоил 2 байта (тег + сам байт), теперь -
-/// 1 байт данных плюс 1/8 байта амортизированно на бит флага, то есть
-/// ~1.125 байта вместо 2.
-///
-/// На данных с редкими совпадениями (уже сжатые игровые ассеты - текстуры,
-/// звук) это меняет всё: раньше LZSS почти удваивал размер файла, теперь
-/// раздувает его всего на ~12%. Для по-настоящему несжимаемых данных этого
-/// всё ещё недостаточно - см. `INCOMPRESSIBLE_RATIO_THRESHOLD` (не сжимать
-/// файл вообще) и `MIN_LITERAL_RUN_LEN` (не платить даже эти ~12% за длинные
-/// подряд идущие несжимаемые участки) ниже.
+const MAX_LENGTH: usize = u8::MAX as usize + MIN_MATCH_LEN;  // 255 + 3 = 258
 const GROUP_SIZE: usize = 8;
-
-/// Окно 32 КиБ - тот же размер, что использует zip/DEFLATE (тот случай,
-/// когда наша константа уже совпадала и трогать её не нужно).
 const WINDOW_SIZE: usize = 32 * 1024;
-
-/// Верхняя граница длины совпадения - используем весь диапазон, который
-/// вообще способен представить формат токена (см. `MAX_LENGTH`): это и
-/// есть те самые 258 байт максимальной длины совпадения из zip/DEFLATE.
 const LOOKAHEAD_SIZE: usize = MAX_LENGTH;
-
 const OUTPUT_FLUSH_SIZE: usize = 512 * 1024;
-
-/// Ленивую проверку имеет смысл делать только для сравнительно КОРОТКИХ
-/// совпадений - см. подробное объяснение в предыдущей версии файла.
 const MAX_LAZY_MATCH_LEN: usize = 32;
-
-/// Для длинного совпадения индексируем только его хвост. Следующая
-/// позиция разбора всё равно получает самые свежие кандидаты, а сотни
-/// записей в hash-chain на каждый 258-байтовый match исчезают. Для
-/// коротких совпадений сохраняем полную индексацию ради степени сжатия.
 const FULL_INSERT_MATCH_LEN: usize = 32;
 const TAIL_INSERTIONS: usize = 8;
-
-/// Размер "первого блока", на котором проверяется, окупается ли сжатие
-/// вообще (см. `INCOMPRESSIBLE_RATIO_THRESHOLD`). Равен `WINDOW_SIZE`:
-/// пока пробная позиция не вышла за его пределы, все прочитанные для пробы
-/// байты гарантированно ещё живы в буфере и доступны для режима
-/// "сохранить как есть", не читая файл заново. Новый `SlidingWindow`
-/// компактируется только перед следующим refill; первый read-блок больше
-/// этого sample, поэтому `base_pos` здесь всё ещё равен нулю.
 const SAMPLE_BLOCK_SIZE: usize = WINDOW_SIZE;
-
-/// Если сжатый пробный блок занимает НЕ МЕНЬШЕ этой доли от размера самого
-/// блока (т.е. LZSS выигрывает меньше ~25%), считаем файл практически
-/// несжимаемым (уже упакованный архив, медиа-ассет и т.п.) и сохраняем
-/// его целиком как есть, не тратя время на разбор оставшихся мегабайт на
-/// токены. Тот же принцип, что и режим STORE в ZIP: пробуем сжать,
-/// сравниваем с оригиналом, при отсутствии выигрыша не сжимаем вообще.
-/// По умолчанию 0.75 - подобрано эмпирически, при необходимости можно
-/// изменить.
 const INCOMPRESSIBLE_RATIO_THRESHOLD: f64 = 0.8;
-
-/// Минимальная длина ПОДРЯД идущих литералов, при которой выгодно
-/// записать их одним "сырым" блоком (`TokenGroupWriter::push_literal_run`)
-/// вместо обычных отдельных литеральных токенов. Сырой блок стоит
-/// `1 бит флага + 2 байта (offset=0, признак) + 2 байта (run_len) + N байт`
-/// против `N бит флагов + N байт` у N отдельных литералов:
-///   N + 4.125 < N * 1.125  =>  4.125 < 0.125*N  =>  N > 33
-/// Отсюда порог 34 - при такой и большей длине сырой блок ГАРАНТИРОВАННО
-/// дешевле поштучной записи; при меньшей - наоборот дороже (постоянные
-/// 4 байта накладных расходов не успевают окупиться).
 const MIN_LITERAL_RUN_LEN: usize = 34;
-
-/// Тело потока - результат разбора на токены LZSS (обычный случай).
 const MODE_COMPRESSED: u8 = 0;
-/// Тело потока - исходные байты без изменений (сработала эвристика
-/// "несжимаемо", см. `INCOMPRESSIBLE_RATIO_THRESHOLD`).
 const MODE_STORED: u8 = 1;
 
 
 pub struct LzssCompressor;
 
-
-/// Копит до `GROUP_SIZE` токенов, прежде чем сбросить флаг-байт + их тела
-/// в выходной буфер. Работает как маленький промежуточный буфер поверх
-/// уже существующего `out_buf` (который сам ограничен `OUTPUT_FLUSH_SIZE`
-/// и периодически сбрасывается в `Artifact`) - размер этого буфера
-/// тривиален (максимум `GROUP_SIZE * (2 + MIN_LITERAL_RUN_LEN)` байт тел
-/// в худшем случае + 1 байт флага), поэтому отдельного учёта в
-/// MemoryBudget не требует.
 struct TokenGroupWriter {
     flags: u8,
     count: u8,
@@ -125,8 +38,6 @@ impl TokenGroupWriter {
     }
 
     fn push_literal(&mut self, byte: u8, out: &mut Vec<u8>) {
-        // Бит остаётся 0 (литерал) - flags уже инициализирован нулями
-        // для текущей группы, ничего дополнительно выставлять не нужно.
         self.bodies.push(byte);
         self.advance(out);
     }
@@ -135,19 +46,11 @@ impl TokenGroupWriter {
         debug_assert!(offset > 0, "offset=0 зарезервирован под литеральную последовательность");
         self.flags |= 1 << self.count;
         self.bodies.extend_from_slice(&(offset as u16).to_le_bytes());
-        // "- MIN_MATCH_LEN" - см. комментарий у константы `MAX_LENGTH`.
         self.bodies.push((length - MIN_MATCH_LEN) as u8);
         self.advance(out);
     }
 
-    /// Записывает ПОДРЯД идущие литералы ОДНИМ телом вместо `bytes.len()`
-    /// отдельных токенов - см. `MIN_LITERAL_RUN_LEN`. Использует тот же
-    /// бит флага, что и совпадение (1), но помечает себя служебным
-    /// значением `offset == 0` - настоящее совпадение никогда не может
-    /// иметь нулевой offset (расстояние назад всегда >= 1), поэтому это
-    /// безопасный признак "здесь не совпадение, а сырой блок литералов":
-    /// на каждый из `bytes.len()` байт НЕ тратится собственный бит флага
-    /// или тег - ровно то, что и просил убрать "метку токена".
+    /// Записывает подряд идущие литералы единым телом
     fn push_literal_run(&mut self, bytes: &[u8], out: &mut Vec<u8>) {
         debug_assert!(bytes.len() >= MIN_LITERAL_RUN_LEN);
         debug_assert!(bytes.len() <= u16::MAX as usize);
@@ -165,17 +68,7 @@ impl TokenGroupWriter {
         }
     }
 
-    /// Сбрасывает текущую (возможно неполную) группу. Неполная группа
-    /// безопасна ТОЛЬКО в самом конце потока: decompress останавливается
-    /// по `original_size` раньше, чем попытается прочитать несуществующие
-    /// "хвостовые" токены - тот же принцип, что и с нулевым паддингом
-    /// последнего байта в BitWriter Хаффмана. Вызывать эту функцию где-то,
-    /// кроме истинного конца файла, НЕЛЬЗЯ: декодер всегда читает ровно
-    /// `GROUP_SIZE` бит флага и остановится раньше только благодаря
-    /// исчерпанию `original_size` - искусственная граница группы посреди
-    /// файла его десинхронизирует (декодер примет несуществующие
-    /// "хвостовые" токены за настоящие и начнёт читать тела следующей,
-    /// уже другой, группы как их данные).
+    /// Сбрасывает текущую (возможно неполную) группу.
     fn flush(&mut self, out: &mut Vec<u8>) {
         if self.count > 0 {
             out.push(self.flags);
@@ -186,22 +79,14 @@ impl TokenGroupWriter {
         }
     }
 
-    /// Сколько байт заняла бы группа, если бы её сейчас пришлось сбросить
-    /// (1 байт флагов + уже накопленные тела) - НЕ мутирует состояние.
-    /// Нужно только для оценки размера пробного блока в эвристике
-    /// "не сжимать несжимаемое": реальный `flush()` здесь недопустим
-    /// именно потому, что мы ещё не на конце файла (см. комментарий выше).
+    /// Подсчет количества байт которые займет группа если сбросить её сейчас
     fn pending_len_if_flushed(&self) -> usize {
         if self.count > 0 { 1 + self.bodies.len() } else { 0 }
     }
 }
 
 
-/// Сбрасывает накопленный буфер подряд идущих литералов `pending` - одним
-/// "сырым" блоком, если его длина оправдывает накладные расходы
-/// (`MIN_LITERAL_RUN_LEN`), иначе как обычные отдельные литеральные
-/// токены (для короткой последовательности сырой блок был бы ДОРОЖЕ, а
-/// не дешевле - см. вывод порога у константы).
+/// Сбрасывает накопленный буфер подряд идущих литералов если их длина удовлетворяет MIN_LITERAL_RUN_LEN
 fn flush_pending_literals(pending: &mut Vec<u8>, group: &mut TokenGroupWriter, out_buf: &mut Vec<u8>) {
     if pending.is_empty() {
         return;
@@ -216,6 +101,7 @@ fn flush_pending_literals(pending: &mut Vec<u8>, group: &mut TokenGroupWriter, o
     pending.clear();
 }
 
+// TODO: можно переиспользовать
 /// Оценивает (НЕ мутируя состояние) сколько байт заняла бы буферизованная
 /// пока литеральная последовательность, если бы её сейчас пришлось
 /// сбросить - по тем же правилам, что и `flush_pending_literals`. Нужна
@@ -234,7 +120,7 @@ fn pending_literals_cost_estimate(pending: &[u8]) -> usize {
 
 
 impl Compressor for LzssCompressor {
-    fn compress(&self, mut artifact: Artifact) -> Result<Artifact, AppError> {
+    fn compress(&self, mut artifact: Artifact) -> Result<(Artifact, CompressionId), AppError> {
         if WINDOW_SIZE == 0 || WINDOW_SIZE > MAX_OFFSET {
             return Err(AppError::Compression(format!(
                 "LZSS: window_size={} вне допустимого диапазона 1..={} (формат хранит offset в 2 байтах)",
@@ -255,19 +141,10 @@ impl Compressor for LzssCompressor {
 
         let mut out_buf: Vec<u8> = Vec::with_capacity(OUTPUT_FLUSH_SIZE);
         let mut group = TokenGroupWriter::new();
-        // Буфер ПОДРЯД идущих литералов, ожидающих решения "поштучно или
-        // одним сырым блоком" - см. `flush_pending_literals`. Ограничен
-        // `u16::MAX` (шириной поля run_len), то есть константой, не
-        // зависящей от размера файла.
         let mut pending_literals: Vec<u8> = Vec::new();
         let mut pos: u64 = 0;
 
-        // --- Эвристика 1: "не сжимать несжимаемое" (как режим STORE в ZIP) ---
-        // Пробно прогоняем через LZSS первый блок (не больше одного окна -
-        // см. комментарий у `SAMPLE_BLOCK_SIZE`) и НИКУДА не пишем
-        // результат, пока не сравним его размер с размером самого блока:
-        // решение "сжимать/не сжимать" ещё не принято, а выходной артефакт
-        // пока даже не создан.
+        // ------------------------------------ Ранняя отсечка файла как НЕ сжимаемого ------------------------------------
         let sample_limit = (SAMPLE_BLOCK_SIZE as u64).min(original_size);
         while pos < sample_limit {
             match compress_step(&mut artifact, &mut window, &mut chain, &mut group, &mut pending_literals, &mut out_buf, pos)? {
@@ -276,19 +153,15 @@ impl Compressor for LzssCompressor {
             }
         }
 
-        // ВАЖНО: ни группу, ни буфер литералов здесь принудительно НЕ
-        // сбрасываем (см. `TokenGroupWriter::flush`) - иначе на границе
-        // пробного блока в середине файла возникла бы неполная группа,
-        // которую декодер не сможет отличить от полной, и поток
-        // рассинхронизируется. Для оценки размера сэмпла достаточно
-        // добавить размер ещё не сброшенных группы и буфера литералов, не
-        // трогая их.
+        // Использование отдельного буффера литералов.
+        // В отсечке сбрасывать по настоящему ЗАПРЕЩЕНО!!!
         let sample_len = pos;
         let sample_compressed_len = out_buf.len()
             + group.pending_len_if_flushed()
             + pending_literals_cost_estimate(&pending_literals);
         let mut output = Artifact::new_with_temp_file_suffix(&artifact, "compressed");
 
+        // Проверка соотношения размера сжатого блока с исходжным
         let incompressible = sample_len > 0
             && sample_compressed_len as f64 >= sample_len as f64 * INCOMPRESSIBLE_RATIO_THRESHOLD;
 
@@ -312,18 +185,16 @@ impl Compressor for LzssCompressor {
             }
             output.write_chunk_from(&raw)?;
 
-            // Остаток файла (если он больше одного блока) - потоково, как есть.
+            // Запись остатка потоково, как есть.
             while let Some(chunk) = artifact.next_chunk()? {
                 output.write_chunk_from(&chunk)?;
             }
 
-            return Ok(output);
+            return Ok((output, CompressionId::NoCompression));
         }
+        // ------------------------------------ Конец ранней отсечки ------------------------------------
 
-        // Сжатие того стоит - дописываем уже посчитанные (сжатые) байты
-        // сэмпла и продолжаем ровно с той же позиции, тем же окном/цепочкой
-        // и тем же буфером литералов, что и при пробном проходе (никакой
-        // повторной работы).
+        // Продолжения сжатия с уже отработанного блока
         output.write_chunk_from(&[MODE_COMPRESSED])?;
         output.write_chunk_from(&original_size.to_le_bytes())?;
         if !out_buf.is_empty() {
@@ -339,22 +210,22 @@ impl Compressor for LzssCompressor {
             flush_if_needed(&mut out_buf, &mut output)?;
         }
 
-        // Сбрасываем то, что осталось: сначала буфер литералов (решает,
-        // сырой блок или поштучно - см. `flush_pending_literals`), затем
-        // незавершённую последнюю группу - иначе до 7 токенов в самом
-        // конце файла потерялись бы, оставшись в `group.bodies`.
+        // Принудительный сброс остатка после окончания работы
         flush_pending_literals(&mut pending_literals, &mut group, &mut out_buf);
         group.flush(&mut out_buf);
         if !out_buf.is_empty() {
             output.write_chunk_from(&out_buf)?;
         }
 
-        Ok(output)
+        Ok((output, CompressionId::LZSS))
     }
+
 
     fn decompress(&self, mut artifact: Artifact) -> Result<Artifact, AppError> {
         let mut output = Artifact::new_with_temp_file_suffix(&artifact, "decompressed");
 
+        //TODO: Переработка пометки архивации файла
+        // ПРОКЛЯТО!!!
         let mut reader = BufferedArtifactReader::new(&mut artifact);
         let mode = reader.read_u8()?;
         let original_size = reader.read_u64_le()?;
@@ -380,6 +251,7 @@ impl Compressor for LzssCompressor {
             return Err(AppError::CorruptArchive(format!("LZSS: неизвестный режим потока: {mode}")));
         }
 
+        // Цикл деархивации
         let mut window = DecodeHistory::new(WINDOW_SIZE);
         let mut out_buf: Vec<u8> = Vec::with_capacity(OUTPUT_FLUSH_SIZE);
         let mut produced: u64 = 0;
@@ -389,22 +261,19 @@ impl Compressor for LzssCompressor {
 
             for bit_idx in 0..GROUP_SIZE {
                 if produced >= original_size {
-                    // Остаток бит текущего флаг-байта - "хвостовой" мусор
-                    // от неполной последней группы, реальных тел под ним
-                    // в потоке нет - прекращаем, не пытаясь их читать.
+                    // Отбраcываем неиспользуемые БИТы флагов из целых БАЙТов
                     break 'outer;
                 }
 
+                // Проверка на нахождение токена
                 let is_match = (flags >> bit_idx) & 1 == 1;
 
                 if is_match {
+                    // Обработка токена
                     let offset = reader.read_u16_le()? as usize;
 
                     if offset == 0 {
-                        // Литеральная последовательность (см.
-                        // `TokenGroupWriter::push_literal_run`) - никакой
-                        // отдельной пометки на каждый байт, просто длина
-                        // и сами байты подряд.
+                        // Обработка ПОСЛЕДОВАТЕЛЬНОСТИ токенов
                         let run_len = reader.read_u16_le()? as usize;
                         if run_len == 0 || run_len as u64 > original_size - produced {
                             return Err(AppError::CorruptArchive(
@@ -416,8 +285,7 @@ impl Compressor for LzssCompressor {
                         window.extend(&out_buf[start..]);
                         produced += run_len as u64;
                     } else {
-                        // "+ MIN_MATCH_LEN" - обратное преобразование к тому,
-                        // что делает `TokenGroupWriter::push_match` при записи.
+                        // Обработка единичного токена
                         let length = reader.read_u8()? as usize + MIN_MATCH_LEN;
 
                         if offset > window.len() || length as u64 > original_size - produced {
@@ -429,12 +297,14 @@ impl Compressor for LzssCompressor {
                         produced += length as u64;
                     }
                 } else {
+                    // Запись некодированного байта
                     let literal = reader.read_u8()?;
                     window.push(literal);
                     out_buf.push(literal);
                     produced += 1;
                 }
 
+                // Сброс буффера
                 if out_buf.len() >= OUTPUT_FLUSH_SIZE {
                     output.write_chunk_from(&out_buf)?;
                     out_buf.clear();
@@ -442,6 +312,7 @@ impl Compressor for LzssCompressor {
             }
         }
 
+        // Принудительный сброс буффера в конце файла
         if !out_buf.is_empty() {
             output.write_chunk_from(&out_buf)?;
         }
@@ -457,18 +328,9 @@ impl Compressor for LzssCompressor {
 
 // ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
 
-/// Один шаг сжатия начиная с позиции `pos`: один токен - литерал (идёт в
-/// буфер `pending_literals`, окончательное решение "поштучно или сырым
-/// блоком" принимается позже, см. `flush_pending_literals`) либо
-/// совпадение (с учётом ленивой проверки, немедленно сбрасывающее
-/// накопленные литералы перед собой). Возвращает новую позицию, либо
-/// `None`, если входные данные закончились.
-///
-/// Вынесено в отдельную функцию, чтобы один и тот же код (включая тонкую
-/// логику ленивого сопоставления) использовался и для пробного сжатия
-/// первого блока (эвристика "не сжимать несжимаемое"), и для сжатия всего
-/// остального файла - без дублирования и без риска, что эти два места
-/// незаметно разойдутся при будущих правках.
+/// Обработка однога шага архивации
+/// Вынесено в отдельную функцию, чтобы использовать при сжатии первого блока
+/// В первом блоке ЗАПРЕЩЕНА запись
 fn compress_step(
     artifact: &mut Artifact,
     window: &mut SlidingWindow,
@@ -479,6 +341,7 @@ fn compress_step(
     pos: u64,
 ) -> Result<Option<u64>, AppError>
 {
+    // Получаем окно на чтение от текущей позиции
     window.ensure_available(artifact, pos, LOOKAHEAD_SIZE + 2)?;
     let available = window.available_after(pos);
     if available == 0 {
@@ -486,6 +349,7 @@ fn compress_step(
     }
 
     let max_len = LOOKAHEAD_SIZE.min(available).min(MAX_LENGTH);
+    // Ищем наибольшую подстроку
     let (offset, length) = find_longest_match(
         window, chain, pos, WINDOW_SIZE as u64, max_len, MIN_MATCH_LEN, MAX_CHAIN_LEN,
     );
@@ -493,6 +357,10 @@ fn compress_step(
     chain.insert(window, pos);
 
     if length >= MIN_MATCH_LEN && length < MAX_LAZY_MATCH_LEN && available > 1 {
+        // ВАЖНАЯ ЭВРИСТИКА
+        // Если текущая подстрока хуже ленивой проверки,
+        // То пробуем увеличить длину за счет смены позиции
+        //TODO: Хрень какая то, разобраться, переделать
         let available_next = window.available_after(pos + 1);
         let max_len_next = LOOKAHEAD_SIZE.min(available_next).min(MAX_LENGTH);
         let (_, length_next) = find_longest_match(
@@ -510,14 +378,13 @@ fn compress_step(
 
     let new_pos;
     if length >= MIN_MATCH_LEN {
-        // Совпадение прерывает (если была) серию литералов - решаем её
-        // судьбу ПРЯМО СЕЙЧАС, а не после: если оставить в буфере, к
-        // моменту следующего решения к ней могли бы приплюсоваться байты
-        // уже ПОСЛЕ этого совпадения, что перепутало бы порядок вывода.
+        // Найдена удовлетворителоьная подстрока
+        // Она прерывает поток литералов, нужно принимать решение о их сбросе из буффера
         flush_pending_literals(pending_literals, group, out_buf);
 
         group.push_match(offset, length, out_buf);
 
+        // Устанавливаем битовый флаг
         let first_to_insert = if length <= FULL_INSERT_MATCH_LEN {
             1
         } else {
@@ -532,6 +399,7 @@ fn compress_step(
 
         new_pos = pos + length as u64;
     } else {
+        // Удовлетворительная подстрока не найдена, продолжаем поток литералов
         pending_literals.push(window.byte_at(pos));
         maybe_flush_overflowing_run(pending_literals, group, out_buf);
         new_pos = pos + 1;
@@ -541,18 +409,15 @@ fn compress_step(
     Ok(Some(new_pos))
 }
 
-/// Буфер литералов ограничен шириной поля `run_len` (`u16`) - если он
-/// достиг предела, сбрасываем его немедленно (гарантированно как сырой
-/// блок, раз уж он такой длинный), чтобы не заставлять его расти
-/// бесконечно на длинных несжимаемых участках. Это единственное место,
-/// где размер `pending_literals` в принципе может достигать нескольких
-/// десятков килобайт, - и он жёстко ограничен константой `u16::MAX`,
-/// не зависящей от размера файла.
+
+/// Буфер литералов ограничен размером u16
+/// При достижении сбрасываем сырым блоком
 fn maybe_flush_overflowing_run(pending: &mut Vec<u8>, group: &mut TokenGroupWriter, out_buf: &mut Vec<u8>) {
     if pending.len() >= u16::MAX as usize {
         flush_pending_literals(pending, group, out_buf);
     }
 }
+
 
 fn flush_if_needed(out_buf: &mut Vec<u8>, output: &mut Artifact) -> Result<(), AppError> {
     if out_buf.len() >= OUTPUT_FLUSH_SIZE {

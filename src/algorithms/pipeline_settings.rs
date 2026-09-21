@@ -2,7 +2,7 @@ use super::ids::{CompressionId, CipherId, FecId};
 
 
 /// Полный набор алгоритмов, применённых к одному файлу.
-/// Каждая запись архива (бывший файл) хранит свою копию PipelineSettings.
+/// Каждая запись архива (бывший файл) хранит свой PipelineSettings.
 #[derive(Debug, Clone, Copy)]
 pub struct PipelineSettings {
     pub compression: CompressionId,
