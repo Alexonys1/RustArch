@@ -1,5 +1,6 @@
 use std::sync::atomic::{AtomicI64, Ordering};
 
+use colored::Colorize;
 
 pub const MEMORY_LIMIT_IN_BYTES: i64 = 6 * 1024_i64.pow(3); // 6GB
 pub static MEMORY_BUDGET_IN_BYTES: AtomicI64 = AtomicI64::new(MEMORY_LIMIT_IN_BYTES);
@@ -79,17 +80,15 @@ pub fn show_memory_bar() {
         let is_filled_now = i < filled;
         let was_filled = i < prev_filled;
 
-        let (color, symbol) =
-        match (is_filled_now, was_filled) {
-            (true, false)  => ("\x1b[32m", '#'), // зелёный - память увеличилась
-            (false, true)  => ("\x1b[36m", '#'), // голубой - память уменьшилась
-            (true, true)   => ("\x1b[0m",  '#'),
-            (false, false) => ("\x1b[0m", ' '),
+        let symbol = match (is_filled_now, was_filled) {
+            (true, false) => "#".green().to_string(), // зелёный - память увеличилась
+            (false, true) => "#".cyan().to_string(),  // голубой - память уменьшилась
+            (true, true) => "#".to_string(),
+            (false, false) => " ".to_string(),
         };
-        bar.push_str(color);
-        bar.push(symbol);
+        bar.push_str(&symbol);
     }
-    bar.push_str("\x1b[0m]"); // сброс цвета
+    bar.push(']');
 
     let used_gb = used;
     let total_gb = total;

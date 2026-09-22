@@ -2,3 +2,4 @@
 /.idea
 /test_data_for_removing
 profile.json*
+*.arch

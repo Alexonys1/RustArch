@@ -6,7 +6,9 @@ use super::core::ALPHABET_SIZE;
 
 pub fn build_tree(nonzero_freqs: &[SymbolWithFreq]) -> NodeOfHuffmanTree {
     let mut heap: BinaryHeap<HeapEntry> = BinaryHeap::with_capacity(nonzero_freqs.len());
-    let mut seq: u64 = 0;
+    let mut seq: u64 = 0; // Дополнительный порядок нужен для объединений листьев.
+    // До этого у нас был алфавитный порядок у символов. Но после объединения
+    // он пропадает. Именно поэтому сравнение листьев происходит через частоты, а потом seq.
 
     for &SymbolWithFreq { symbol, freq } in nonzero_freqs.iter() {
         heap.push(HeapEntry { node: NodeOfHuffmanTree::Leaf { symbol, freq }, seq });
@@ -108,8 +110,8 @@ impl PartialOrd for HeapEntry {
 }
 
 impl Ord for HeapEntry {
-    fn cmp(&self, other: &Self) -> Ordering {
-        other.node.freq().cmp(&self.node.freq())
+    fn cmp(&self, other: &Self) -> Ordering { // Сравнение развёрнуто!! Листья дерева минимальны, а не максимальны.
+        other.node.freq().cmp(&self.node.freq()) // Корень максимален.
             .then_with(|| other.seq.cmp(&self.seq))
     }
 }

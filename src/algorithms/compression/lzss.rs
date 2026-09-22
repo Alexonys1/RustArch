@@ -24,6 +24,185 @@ const MIN_LITERAL_RUN_LEN: usize = 34;
 
 pub struct LzssCompressor;
 
+impl Compressor for LzssCompressor {
+    fn compress(&self, artifact: Artifact) -> Result<(Artifact, CompressionId), AppError> {
+        self.compress_impl(artifact, true)
+    }
+
+    fn decompress(&self, mut artifact: Artifact, entry: &ArchivedArtifactEntry) -> Result<Artifact, AppError> {
+        let mut output = Artifact::new_with_temp_file_suffix(&artifact, "decompressed");
+
+        let mut reader = BufferedArtifactReader::new(&mut artifact);
+        let original_size: u64 = entry.original_size;
+
+        // Цикл деархивации
+        let mut window = DecodeHistory::new(WINDOW_SIZE);
+        let mut out_buf: Vec<u8> = Vec::with_capacity(OUTPUT_FLUSH_SIZE);
+        let mut produced: u64 = 0;
+
+        'outer: while produced < original_size {
+            let flags = reader.read_u8()?;
+
+            for bit_idx in 0..GROUP_SIZE {
+                if produced >= original_size {
+                    // Отбраcываем неиспользуемые БИТы флагов из целых БАЙТов
+                    break 'outer;
+                }
+
+                // Проверка на нахождение токена
+                let is_match = (flags >> bit_idx) & 1 == 1;
+
+                if is_match {
+                    // Обработка токена
+                    let offset = reader.read_u16_le()? as usize;
+
+                    if offset == 0 {
+                        // Обработка ПОСЛЕДОВАТЕЛЬНОСТИ токенов
+                        let run_len = reader.read_u16_le()? as usize;
+                        if run_len == 0 || run_len as u64 > original_size - produced {
+                            return Err(AppError::CorruptArchive(
+                                "LZSS: некорректная длина литерального блока".to_string(),
+                            ));
+                        }
+                        let start = out_buf.len();
+                        reader.append_exact(run_len, &mut out_buf)?;
+                        window.extend(&out_buf[start..]);
+                        produced += run_len as u64;
+                    } else {
+                        // Обработка единичного токена
+                        let length = reader.read_u8()? as usize + MIN_MATCH_LEN;
+
+                        if offset > window.len() || length as u64 > original_size - produced {
+                            return Err(AppError::CorruptArchive(
+                                "LZSS: некорректная ссылка назад".to_string(),
+                            ));
+                        }
+                        window.copy_match(offset, length, &mut out_buf)?;
+                        produced += length as u64;
+                    }
+                } else {
+                    // Запись некодированного байта
+                    let literal = reader.read_u8()?;
+                    window.push(literal);
+                    out_buf.push(literal);
+                    produced += 1;
+                }
+
+                // Сброс буффера
+                if out_buf.len() >= OUTPUT_FLUSH_SIZE {
+                    output.write_chunk_from(&out_buf)?;
+                    out_buf.clear();
+                }
+            }
+        }
+
+        // Принудительный сброс буффера в конце файла
+        if !out_buf.is_empty() {
+            output.write_chunk_from(&out_buf)?;
+        }
+
+        Ok(output)
+    }
+
+    fn id(&self) -> CompressionId {
+        CompressionId::LZSS
+    }
+}
+
+
+impl LzssCompressor {
+    fn compress_impl(&self, mut artifact: Artifact, allow_passthrough: bool) -> Result<(Artifact, CompressionId), AppError> {
+        if WINDOW_SIZE == 0 || WINDOW_SIZE > MAX_OFFSET {
+            return Err(AppError::Compression(format!(
+                "LZSS: window_size={} вне допустимого диапазона 1..={} (формат хранит offset в 2 байтах)",
+                WINDOW_SIZE, MAX_OFFSET
+            )));
+        }
+        if LOOKAHEAD_SIZE == 0 || LOOKAHEAD_SIZE > MAX_LENGTH {
+            return Err(AppError::Compression(format!(
+                "LZSS: lookahead_size={} вне допустимого диапазона 1..={} (формат хранит length - {MIN_MATCH_LEN} в 1 байте)",
+                LOOKAHEAD_SIZE, MAX_LENGTH
+            )));
+        }
+
+        let original_size = artifact.get_payload_size() as u64;
+
+        let mut window = SlidingWindow::new(WINDOW_SIZE, LOOKAHEAD_SIZE)?;
+        let mut chain = HashChain::new(WINDOW_SIZE)?;
+
+        let mut out_buf: Vec<u8> = Vec::with_capacity(OUTPUT_FLUSH_SIZE);
+        let mut group = TokenGroupWriter::new();
+        let mut pending_literals: Vec<u8> = Vec::new();
+        let mut pos: u64 = 0;
+
+        // ------------------------------------ Ранняя отсечка файла как НЕ сжимаемого ------------------------------------
+        let sample_limit = (SAMPLE_BLOCK_SIZE as u64).min(original_size);
+        while pos < sample_limit {
+            match compress_step(
+                &mut artifact,
+                &mut window,
+                &mut chain,
+                &mut group,
+                &mut pending_literals,
+                &mut out_buf,
+                pos,
+            )? {
+                Some(new_pos) => pos = new_pos,
+                None => break, // файл закончился раньше конца пробного блока
+            }
+        }
+
+        // Использование отдельного буффера литералов.
+        // В отсечке сбрасывать по настоящему ЗАПРЕЩЕНО!!!
+        let sample_len = pos;
+        let sample_compressed_len = out_buf.len()
+            + group.pending_len_if_flushed()
+            + pending_literals_cost_estimate(&pending_literals);
+        // Проверка соотношения размера сжатого блока с исходжным
+        let incompressible = sample_len > 0
+            && sample_compressed_len as f64 >= sample_len as f64 * INCOMPRESSIBLE_RATIO_THRESHOLD;
+
+        if allow_passthrough && incompressible {
+            artifact.rewind_reading();
+            return Ok((artifact, CompressionId::NoCompression));
+        }
+        // ------------------------------------ Конец ранней отсечки ------------------------------------
+
+        // Продолжения сжатия с уже отработанного блока
+        let mut output = Artifact::new_with_temp_file_suffix(&artifact, "compressed");
+        if !out_buf.is_empty() {
+            output.write_chunk_from(&out_buf)?;
+            out_buf.clear();
+        }
+
+        loop {
+            match compress_step(
+                &mut artifact,
+                &mut window,
+                &mut chain,
+                &mut group,
+                &mut pending_literals,
+                &mut out_buf,
+                pos,
+            )? {
+                Some(new_pos) => pos = new_pos,
+                None => break,
+            }
+            flush_if_needed(&mut out_buf, &mut output)?;
+        }
+
+        // Принудительный сброс остатка после окончания работы
+        flush_pending_literals(&mut pending_literals, &mut group, &mut out_buf);
+        group.flush(&mut out_buf);
+        if !out_buf.is_empty() {
+            output.write_chunk_from(&out_buf)?;
+        }
+
+        Ok((output, CompressionId::LZSS))
+    }
+}
+
+
 struct TokenGroupWriter {
     flags: u8,
     count: u8,
@@ -133,187 +312,6 @@ fn pending_literals_cost_estimate(pending: &[u8]) -> usize {
     }
 }
 
-impl LzssCompressor {
-    fn compress_impl(
-        &self,
-        mut artifact: Artifact,
-        allow_passthrough: bool,
-    ) -> Result<(Artifact, CompressionId), AppError>
-    {
-        if WINDOW_SIZE == 0 || WINDOW_SIZE > MAX_OFFSET {
-            return Err(AppError::Compression(format!(
-                "LZSS: window_size={} вне допустимого диапазона 1..={} (формат хранит offset в 2 байтах)",
-                WINDOW_SIZE, MAX_OFFSET
-            )));
-        }
-        if LOOKAHEAD_SIZE == 0 || LOOKAHEAD_SIZE > MAX_LENGTH {
-            return Err(AppError::Compression(format!(
-                "LZSS: lookahead_size={} вне допустимого диапазона 1..={} (формат хранит length - {MIN_MATCH_LEN} в 1 байте)",
-                LOOKAHEAD_SIZE, MAX_LENGTH
-            )));
-        }
-
-        let original_size = artifact.get_payload_size() as u64;
-
-        let mut window = SlidingWindow::new(WINDOW_SIZE, LOOKAHEAD_SIZE)?;
-        let mut chain = HashChain::new(WINDOW_SIZE)?;
-
-        let mut out_buf: Vec<u8> = Vec::with_capacity(OUTPUT_FLUSH_SIZE);
-        let mut group = TokenGroupWriter::new();
-        let mut pending_literals: Vec<u8> = Vec::new();
-        let mut pos: u64 = 0;
-
-        // ------------------------------------ Ранняя отсечка файла как НЕ сжимаемого ------------------------------------
-        let sample_limit = (SAMPLE_BLOCK_SIZE as u64).min(original_size);
-        while pos < sample_limit {
-            match compress_step(
-                &mut artifact,
-                &mut window,
-                &mut chain,
-                &mut group,
-                &mut pending_literals,
-                &mut out_buf,
-                pos,
-            )? {
-                Some(new_pos) => pos = new_pos,
-                None => break, // файл закончился раньше конца пробного блока
-            }
-        }
-
-        // Использование отдельного буффера литералов.
-        // В отсечке сбрасывать по настоящему ЗАПРЕЩЕНО!!!
-        let sample_len = pos;
-        let sample_compressed_len = out_buf.len()
-            + group.pending_len_if_flushed()
-            + pending_literals_cost_estimate(&pending_literals);
-        // Проверка соотношения размера сжатого блока с исходжным
-        let incompressible = sample_len > 0
-            && sample_compressed_len as f64 >= sample_len as f64 * INCOMPRESSIBLE_RATIO_THRESHOLD;
-
-        if allow_passthrough && incompressible {
-            artifact.rewind_reading();
-            return Ok((artifact, CompressionId::NoCompression));
-        }
-        // ------------------------------------ Конец ранней отсечки ------------------------------------
-
-        // Продолжения сжатия с уже отработанного блока
-        let mut output = Artifact::new_with_temp_file_suffix(&artifact, "compressed");
-        if !out_buf.is_empty() {
-            output.write_chunk_from(&out_buf)?;
-            out_buf.clear();
-        }
-
-        loop {
-            match compress_step(
-                &mut artifact,
-                &mut window,
-                &mut chain,
-                &mut group,
-                &mut pending_literals,
-                &mut out_buf,
-                pos,
-            )? {
-                Some(new_pos) => pos = new_pos,
-                None => break,
-            }
-            flush_if_needed(&mut out_buf, &mut output)?;
-        }
-
-        // Принудительный сброс остатка после окончания работы
-        flush_pending_literals(&mut pending_literals, &mut group, &mut out_buf);
-        group.flush(&mut out_buf);
-        if !out_buf.is_empty() {
-            output.write_chunk_from(&out_buf)?;
-        }
-
-        Ok((output, CompressionId::LZSS))
-    }
-}
-
-impl Compressor for LzssCompressor {
-    fn compress(&self, artifact: Artifact) -> Result<(Artifact, CompressionId), AppError> {
-        self.compress_impl(artifact, true)
-    }
-
-    fn decompress(&self, mut artifact: Artifact, entry: &ArchivedArtifactEntry) -> Result<Artifact, AppError> {
-        let mut output = Artifact::new_with_temp_file_suffix(&artifact, "decompressed");
-
-        let mut reader = BufferedArtifactReader::new(&mut artifact);
-        let original_size: u64 = entry.original_size;
-
-        // Цикл деархивации
-        let mut window = DecodeHistory::new(WINDOW_SIZE);
-        let mut out_buf: Vec<u8> = Vec::with_capacity(OUTPUT_FLUSH_SIZE);
-        let mut produced: u64 = 0;
-
-        'outer: while produced < original_size {
-            let flags = reader.read_u8()?;
-
-            for bit_idx in 0..GROUP_SIZE {
-                if produced >= original_size {
-                    // Отбраcываем неиспользуемые БИТы флагов из целых БАЙТов
-                    break 'outer;
-                }
-
-                // Проверка на нахождение токена
-                let is_match = (flags >> bit_idx) & 1 == 1;
-
-                if is_match {
-                    // Обработка токена
-                    let offset = reader.read_u16_le()? as usize;
-
-                    if offset == 0 {
-                        // Обработка ПОСЛЕДОВАТЕЛЬНОСТИ токенов
-                        let run_len = reader.read_u16_le()? as usize;
-                        if run_len == 0 || run_len as u64 > original_size - produced {
-                            return Err(AppError::CorruptArchive(
-                                "LZSS: некорректная длина литерального блока".to_string(),
-                            ));
-                        }
-                        let start = out_buf.len();
-                        reader.append_exact(run_len, &mut out_buf)?;
-                        window.extend(&out_buf[start..]);
-                        produced += run_len as u64;
-                    } else {
-                        // Обработка единичного токена
-                        let length = reader.read_u8()? as usize + MIN_MATCH_LEN;
-
-                        if offset > window.len() || length as u64 > original_size - produced {
-                            return Err(AppError::CorruptArchive(
-                                "LZSS: некорректная ссылка назад".to_string(),
-                            ));
-                        }
-                        window.copy_match(offset, length, &mut out_buf)?;
-                        produced += length as u64;
-                    }
-                } else {
-                    // Запись некодированного байта
-                    let literal = reader.read_u8()?;
-                    window.push(literal);
-                    out_buf.push(literal);
-                    produced += 1;
-                }
-
-                // Сброс буффера
-                if out_buf.len() >= OUTPUT_FLUSH_SIZE {
-                    output.write_chunk_from(&out_buf)?;
-                    out_buf.clear();
-                }
-            }
-        }
-
-        // Принудительный сброс буффера в конце файла
-        if !out_buf.is_empty() {
-            output.write_chunk_from(&out_buf)?;
-        }
-
-        Ok(output)
-    }
-
-    fn id(&self) -> CompressionId {
-        CompressionId::LZSS
-    }
-}
 
 // ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
 

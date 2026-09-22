@@ -1,6 +1,8 @@
 use std::ffi::{OsStr, OsString};
-use std::path::PathBuf;
 use std::fs;
+use std::path::PathBuf;
+
+use colored::Colorize;
 
 use crate::algorithms::{CipherId, CompressionId, FecId, PipelineSettings};
 use crate::error::AppError;
@@ -65,7 +67,20 @@ pub const HELP: &str = r#"rustarch - многопоточный архивато
 
 
 pub fn print_help() {
-    print!("{HELP}");
+    for (index, line) in HELP.lines().enumerate() {
+        let trimmed = line.trim_start();
+        if index == 0 {
+            println!("{}", line.cyan().bold());
+        } else if !line.starts_with(char::is_whitespace) && line.ends_with(':') {
+            println!("{}", line.yellow().bold());
+        } else if trimmed.starts_with("rustarch ") {
+            println!("{}", line.cyan());
+        } else if trimmed.starts_with('-') {
+            println!("{}", line.cyan());
+        } else {
+            println!("{line}");
+        }
+    }
 }
 
 pub fn parse_args<IntoIter, T>(args: IntoIter) -> Result<CLICommand, AppError>

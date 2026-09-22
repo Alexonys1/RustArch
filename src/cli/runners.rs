@@ -2,6 +2,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, channel};
 
+use colored::Colorize;
+
 use crate::error::AppError;
 use crate::algorithms::PipelineSettings;
 use crate::archiver::{ArchivedDirectoryEntry, ArchivedArtifactEntry, Artifact, WalkResult, WalkedFile};
@@ -35,7 +37,11 @@ pub fn run_command(command: CLICommand) -> Result<(), AppError> {
         }
 
         CLICommand::Version => {
-            println!("rustarch {}", env!("CARGO_PKG_VERSION"));
+            println!(
+                "{} {}",
+                "rustarch".cyan().bold(),
+                env!("CARGO_PKG_VERSION").cyan(),
+            );
             Ok(())
         }
     }
@@ -130,51 +136,70 @@ pub fn run_list(archive_path: &Path) -> Result<(), AppError> {
     let total_stored = files
         .iter()
         .fold(0u64, |sum, entry| sum.saturating_add(entry.stored_size));
+    let total_saved_ratio = format_saved_ratio(total_original, total_stored);
 
-    println!("Архив: {}", archive_path.display());
     println!(
-        "Записей: {} файлов, {} директорий; исходный размер: {}; payload: {}",
-        files.len(),
-        directories.len(),
-        to_human_size(total_original),
-        to_human_size(total_stored),
+        "{} {}",
+        "Архив:".bold(),
+        archive_path.display().to_string().cyan(),
+    );
+    println!(
+        "{} {} файлов, {} директорий; {} {}; {} {}; {} {}",
+        "Записей:".bold(),
+        files.len().to_string().cyan(),
+        directories.len().to_string().cyan(),
+        "исходный размер:".bold(),
+        to_human_size(total_original).cyan(),
+        "payload:".bold(),
+        to_human_size(total_stored).cyan(),
+        "сжатие:".bold(),
+        total_saved_ratio.cyan(),
     );
     println!();
-    println!(
+    let header = format!(
         "{:<4} {:>12} {:>12} {:>8} {:<12} {:<8} {:<12} {}",
         "TYPE", "ORIGINAL", "STORED", "RATIO", "COMPRESSION", "CIPHER", "FEC", "PATH"
     );
+    println!("{}", header.cyan().bold());
 
     for entry in files {
-        let ratio = if entry.original_size == 0 {
-            "-".to_string()
-        } else {
-            format!(
-                "{:.1}%",
-                entry.stored_size as f64 / entry.original_size as f64 * 100.0
-            )
-        };
-        println!(
-            "{:<4} {:>12} {:>12} {:>8} {:<12} {:<8} {:<12} {}",
-            "FILE",
-            to_human_size(entry.original_size),
-            to_human_size(entry.stored_size),
-            ratio,
-            entry.pipeline.compression.as_str(),
-            entry.pipeline.cipher.as_str(),
-            entry.pipeline.fec.as_str(),
-            entry.relative_path,
-        );
+        let saved_ratio = format_saved_ratio(entry.original_size, entry.stored_size);
+        let kind = format!("{:<4}", "FILE").green().bold();
+        let original = format!("{:>12}", to_human_size(entry.original_size)).cyan();
+        let stored = format!("{:>12}", to_human_size(entry.stored_size)).cyan();
+        let saved_ratio = format!("{:>8}", saved_ratio).cyan();
+        let compression = format!("{:<12}", entry.pipeline.compression.as_str()).yellow();
+        let cipher = format!("{:<8}", entry.pipeline.cipher.as_str()).yellow();
+        let fec = format!("{:<12}", entry.pipeline.fec.as_str()).yellow();
+        let path = entry.relative_path.to_string().cyan();
+        println!("{kind} {original} {stored} {saved_ratio} {compression} {cipher} {fec} {path}");
     }
 
     for entry in directories {
-        println!(
-            "{:<4} {:>12} {:>12} {:>8} {:<12} {:<8} {:<12} {}",
-            "DIR", "-", "-", "-", "-", "-", "-", entry.relative_path
-        );
+        let kind = format!("{:<4}", "DIR").blue().bold();
+        let original = format!("{:>12}", "-").dimmed();
+        let stored = format!("{:>12}", "-").dimmed();
+        let saved_ratio = format!("{:>8}", "-").dimmed();
+        let compression = format!("{:<12}", "-").dimmed();
+        let cipher = format!("{:<8}", "-").dimmed();
+        let fec = format!("{:<12}", "-").dimmed();
+        let path = entry.relative_path.to_string().cyan();
+        println!("{kind} {original} {stored} {saved_ratio} {compression} {cipher} {fec} {path}");
     }
 
     Ok(())
+}
+
+
+fn format_saved_ratio(original_size: u64, stored_size: u64) -> String {
+    if original_size == 0 {
+        "-".to_string()
+    } else {
+        format!(
+            "{:.1}%",
+            (1.0 - stored_size as f64 / original_size as f64) * 100.0,
+        )
+    }
 }
 
 

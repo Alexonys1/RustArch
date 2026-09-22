@@ -27,7 +27,7 @@ pub struct HuffmanCompressor;
 impl Compressor for HuffmanCompressor {
     fn compress(&self, artifact: Artifact) -> Result<(Artifact, CompressionId), AppError> {
         self.compress_impl(artifact, true) // Роберт Мартин был бы в бешенстве от передачи флагов в функции xD
-    }
+    } // Здесь был Максим
 
     fn decompress(&self, mut artifact: Artifact, _: &ArchivedArtifactEntry) -> Result<Artifact, AppError> {
         // ============================ ЧИТАЕМ ЗАГОЛОВОК ФАЙЛА ==========================
@@ -155,7 +155,15 @@ impl HuffmanCompressor {
         Ok(self.compress_impl(artifact, false)?.0)
     }
 
+    /// Очевидно, сжимает Хаффманом. Если `allow_passthrough = true`, то алгоритм может по своему усмотрению
+    /// не сжимать файл, если это не выгодно. Если `allow_passthrough = false`, то сжатие принудительное.
     fn compress_impl(&self, mut artifact: Artifact, allow_passthrough: bool) -> Result<(Artifact, CompressionId), AppError> {
+
+        //TODO: Со временем мне кажется, что разбиение кода на функции лучше, чем добавление всюду комментариев.
+        // Но это требует больших усилий при программировании.
+        // Зато получается более читаемый код (см. мой парсер ассемблера RISK-V).
+
+        // ============================== СЧИТАЕМ ЧАСТОТЫ ================================
         let mut freqs = [0_u64; ALPHABET_SIZE]; // Индекс и есть сам символ (чтобы не забыть)
         let mut original_size: u64 = 0;
 
@@ -173,8 +181,20 @@ impl HuffmanCompressor {
             .filter(|&(_, f)| f > 0)
             .map(|(symbol, f)| SymbolWithFreq { symbol: symbol as u8, freq: f })
             .collect();
+        // ============================== СЧИТАЕМ ЧАСТОТЫ ================================
 
+
+        // ======= ЗАЩИТА ОТ МАЛЕНЬКИХ ФАЙЛОВ И ЭВРИСТИКИ ДЛЯ ОТКЛОНЕНИЯ НЕСЖИМАЕМЫХ ФАЙЛОВ ========
         if original_size == 0 {
+            return Ok((artifact, CompressionId::NoCompression));
+        }
+
+        let header_bytes: u64 = 2 + nonzero_freqs.len() as u64 * 9;
+
+        // Эта проверка на микро файл нужна, потому что дальше может сработать следующий if,
+        // который может записать огромный заголовок (по сравнению с файлом),
+        // и сжатие превратится в раздутие:
+        if allow_passthrough && header_bytes >= original_size {
             return Ok((artifact, CompressionId::NoCompression));
         }
 
@@ -183,21 +203,29 @@ impl HuffmanCompressor {
             write_header(&mut output, &nonzero_freqs)?;
             return Ok((output, CompressionId::Huffman));
         }
+        // ======= ЗАЩИТА ОТ МАЛЕНЬКИХ ФАЙЛОВ И ЭВРИСТИКИ ДЛЯ ОТКЛОНЕНИЯ НЕСЖИМАЕМЫХ ФАЙЛОВ ========
 
+
+        // ========================== СТРОИМ ДЕРЕВО ХАФФМАНА ===================================
         let tree: NodeOfHuffmanTree = build_tree(&nonzero_freqs);
         let codes: [HuffmanCode; ALPHABET_SIZE] = create_huffman_codes(tree);
+        // ========================== СТРОИМ ДЕРЕВО ХАФФМАНА ===================================
 
-        let header_bytes = 2u128 + nonzero_freqs.len() as u128 * 9;
-        let encoded_bits: u128 = nonzero_freqs
+
+        // =============== ЕЩЁ ОДНА ЭВРИСТИКА ДЛЯ ОТКЛОНЕНИЯ НЕСЖИМАЕМОГО ФАЙЛА ====================
+        let encoded_bits: u64 = nonzero_freqs
             .iter()
-            .map(|entry| codes[entry.symbol as usize].len as u128 * entry.freq as u128)
+            .map(|entry| codes[entry.symbol as usize].len as u64 * entry.freq)
             .sum();
         let encoded_size = header_bytes + encoded_bits.div_ceil(8);
 
-        if allow_passthrough && encoded_size >= original_size as u128 {
+        if allow_passthrough && encoded_size >= original_size {
             return Ok((artifact, CompressionId::NoCompression));
         }
+        // =============== ЕЩЁ ОДНА ЭВРИСТИКА ДЛЯ ОТКЛОНЕНИЯ НЕСЖИМАЕМОГО ФАЙЛА ====================
 
+
+        // =============================== НЕПОСРЕДСТВЕННО, СЖАТИЕ =================================
         let mut output_artifact = Artifact::new_with_temp_file_suffix(&artifact, "compressed");
         write_header(&mut output_artifact, &nonzero_freqs)?;
 
