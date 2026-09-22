@@ -10,6 +10,7 @@ pub struct StreamingBitWriter<'a> {
     nbits: u32,
 }
 
+
 impl<'a> StreamingBitWriter<'a> {
     pub fn new(output: &'a mut Artifact) -> Self {
         Self { output, buf: Vec::with_capacity(OUTPUT_FLUSH_SIZE), acc: 0, nbits: 0 }
@@ -59,7 +60,7 @@ pub struct BitWindow<'a> {
     artifact: &'a mut Artifact,
     chunk: Vec<u8>,
     chunk_pos: usize,
-    acc: u32,   // валидные биты - в СТАРШИХ разрядах (MSB-first)
+    acc: u32,   // валидные биты - в СТАРШИХ разрядах
     nbits: u32,
 }
 

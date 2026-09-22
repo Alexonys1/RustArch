@@ -1,6 +1,6 @@
 use std::fs::File;
-use std::path::PathBuf;
 use std::io::{Seek, SeekFrom};
+use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
 use std::thread::JoinHandle;
 

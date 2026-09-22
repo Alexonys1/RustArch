@@ -3,27 +3,32 @@ use std::collections::BinaryHeap;
 use std::path::Path;
 use std::thread;
 
-use crate::error::AppError;
-use crate::archiver::ArchiveEntry;
 use super::one_file::unpack_file;
+use crate::archiver::ArchivedArtifactEntry;
+use crate::error::AppError;
+
 
 const MAX_PARALLELISM: usize = usize::MAX;
 
+
 pub fn unpack_entries_parallel(
-    entries: Vec<ArchiveEntry>,
+    entries: Vec<ArchivedArtifactEntry>,
     archive_path: &Path,
     output_dir: &Path,
     decode_key: &[u8],
-) -> Result<(), AppError> {
+) -> Result<(), AppError>
+{
     let groups_of_entries = group_entries_for_workers(&entries);
 
     thread::scope(|scope| {
         let mut workers = Vec::with_capacity(groups_of_entries.len());
 
         for entry_group in &groups_of_entries {
-            workers.push(scope.spawn(|| {
-                handle_entry_group(entry_group, archive_path, output_dir, decode_key)
-            }));
+            workers.push(
+                scope.spawn(|| {
+                    unpack_entry_group(entry_group, archive_path, output_dir, decode_key)
+                }),
+            );
         }
 
         for worker in workers {
@@ -36,8 +41,9 @@ pub fn unpack_entries_parallel(
     })
 }
 
-fn handle_entry_group(
-    entry_group: &[&ArchiveEntry],
+
+fn unpack_entry_group(
+    entry_group: &[&ArchivedArtifactEntry],
     archive_path: &Path,
     output_dir: &Path,
     decode_key: &[u8],
@@ -48,11 +54,11 @@ fn handle_entry_group(
     Ok(())
 }
 
-fn entry_weight(entry: &ArchiveEntry) -> u64 {
+fn entry_weight(entry: &ArchivedArtifactEntry) -> u64 {
     entry.stored_size.max(1)
 }
 
-fn group_entries_for_workers(entries: &[ArchiveEntry]) -> Vec<Vec<&ArchiveEntry>> {
+fn group_entries_for_workers(entries: &[ArchivedArtifactEntry]) -> Vec<Vec<&ArchivedArtifactEntry>> {
     if entries.is_empty() {
         return Vec::new();
     }
@@ -63,10 +69,10 @@ fn group_entries_for_workers(entries: &[ArchiveEntry]) -> Vec<Vec<&ArchiveEntry>
         .min(entries.len())
         .min(MAX_PARALLELISM);
 
-    let mut sorted: Vec<&ArchiveEntry> = entries.iter().collect();
+    let mut sorted: Vec<&ArchivedArtifactEntry> = entries.iter().collect();
     sorted.sort_unstable_by_key(|e| Reverse(entry_weight(e)));
 
-    let mut groups: Vec<Vec<&ArchiveEntry>> =
+    let mut groups: Vec<Vec<&ArchivedArtifactEntry>> =
         (0..number_of_workers).map(|_| Vec::new()).collect();
     let mut loads: BinaryHeap<Reverse<(u64, usize)>> =
         (0..number_of_workers).map(|i| Reverse((0, i))).collect();

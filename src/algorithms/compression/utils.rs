@@ -5,7 +5,7 @@ use crate::archiver::Artifact;
 use crate::archiver::memory_budget::BudgetGuard; // поправьте путь под свою иерархию
 
 // ---------------------------------------------------------------------
-// SlidingWindow — ограниченный по памяти буфер входных данных
+// SlidingWindow - ограниченный по памяти буфер входных данных
 // ---------------------------------------------------------------------
 
 /// Читаем вход сравнительно крупными блоками, но не позволяем размеру
@@ -23,7 +23,7 @@ const INPUT_READ_SIZE: usize = 64 * 1024;
 /// и какое-то количество байт упреждающего просмотра впереди. Размер
 /// буфера НЕ зависит от размера обрабатываемого файла.
 ///
-/// Хранилище — непрерывный `Vec<u8>` (не `VecDeque`). Оно компактируется
+/// Хранилище - непрерывный `Vec<u8>` (не `VecDeque`). Оно компактируется
 /// через `copy_within` только перед refill, поэтому `slice_from()` всегда
 /// возвращает настоящий срез `&[u8]` для 8-байтового сравнения.
 pub struct SlidingWindow {
@@ -123,7 +123,7 @@ impl SlidingWindow {
 }
 
 // ---------------------------------------------------------------------
-// HashChain — поиск совпадений без HashMap/SipHash
+// HashChain - поиск совпадений без HashMap/SipHash
 // ---------------------------------------------------------------------
 
 /// Размер таблицы голов хэш-цепочек. Фиксированная константа - в отличие
@@ -227,7 +227,7 @@ fn common_prefix_len(a: &[u8], b: &[u8], max_len: usize) -> usize {
         let wb = u64::from_le_bytes(b[len..len + 8].try_into().unwrap());
         let diff = wa ^ wb;
         if diff != 0 {
-            // Благодаря from_le_bytes trailing_zeros/8 — номер первого
+            // Благодаря from_le_bytes trailing_zeros/8 - номер первого
             // несовпадающего байта на любой endian-архитектуре.
             return len + (diff.trailing_zeros() / 8) as usize;
         }
@@ -271,7 +271,7 @@ pub fn find_longest_match(
     let mut best_len = 0usize;
     let mut best_offset = 0usize;
 
-    // Самый частый случай на низкоэнтропийных данных — серия одного
+    // Самый частый случай на низкоэнтропийных данных - серия одного
     // байта. Для offset=1 длинное совпадение можно принять без обхода
     // хэш-цепочки.
     if pos > window_start && window.byte_at(pos - 1) == current[0] {
@@ -329,7 +329,7 @@ pub fn find_longest_match(
 }
 
 // ---------------------------------------------------------------------
-// BufferedArtifactReader — читает токены декомпрессии пачками, а не по
+// BufferedArtifactReader - читает токены декомпрессии пачками, а не по
 // 1-2 байта напрямую из Artifact (который на File-состоянии делает
 // seek()+read() НА КАЖДЫЙ такой вызов - это и был отдельный источник
 // торможения, не связанный с памятью).
@@ -479,143 +479,3 @@ pub fn flush_if_needed(out_buf: &mut Vec<u8>, output: &mut Artifact, output_flus
     }
     Ok(())
 }
-
-
-
-// =====================================================================
-// ReverseChain — хэш-цепочка для ОБРАТНЫХ совпадений
-// =====================================================================
-//
-// Отличие от HashChain: позиция `b` индексируется по ОБРАТНОМУ 3-грамму
-// (window[b], window[b-1], window[b-2]), а не по прямому
-// (window[b], window[b+1], window[b+2]). Это позволяет по 3-байтовому
-// префиксу lookahead-а (input[pos..pos+3]) находить в окне такие `b`,
-// что window[b]=input[pos], window[b-1]=input[pos+1], window[b-2]=input[pos+2],
-// т.е. кандидатов на ОБРАТНОЕ совпадение:
-//     window[a + i] == input[pos + L - 1 - i]   для i in 0..L,
-// где a = b - L + 1.
-//
-// Память: те же два массива фиксированного размера, что и у HashChain
-// (HASH_SIZE + window_size записей u64). Trim не нужен: старые позиции
-// отсекаются на этапе candidates() по границе окна.
-pub struct ReverseChain {
-    head: Vec<u64>,
-    prev: Vec<u64>,
-    window_size: usize,
-    _guard: BudgetGuard,
-}
-
-impl ReverseChain {
-    pub fn new(window_size: usize) -> Result<Self, AppError> {
-        let bytes = (HASH_SIZE + window_size) * std::mem::size_of::<u64>();
-        let mut guard = BudgetGuard::default();
-        if !guard.try_grow(bytes as i64) {
-            return Err(AppError::Compression(format!(
-                "LZSS: не удалось зарезервировать {bytes} байт под обратную хэш-таблицу - бюджет памяти исчерпан"
-            )));
-        }
-        Ok(Self {
-            head: vec![NONE; HASH_SIZE],
-            prev: vec![NONE; window_size],
-            window_size,
-            _guard: guard,
-        })
-    }
-
-    fn hash3(b0: u8, b1: u8, b2: u8) -> usize {
-        let v = (b0 as u32) | ((b1 as u32) << 8) | ((b2 as u32) << 16);
-        ((v.wrapping_mul(2_654_435_761)) >> (32 - HASH_BITS)) as usize
-    }
-
-    /// Индексирует позицию `pos` как КОНЕЦ обратного 3-грамма:
-    /// хэшируется тройка (window[pos], window[pos-1], window[pos-2]).
-    /// Требует pos >= 2 и чтобы байты pos-2..=pos были в буфере.
-    ///
-    /// Инвариант: компрессор вызывает insert() только для позиций,
-    /// прошедших `SlidingWindow::trim_if_needed` (или находящихся в
-    /// начале потока), поэтому `pos - 2 >= base_pos` здесь всегда
-    /// выполняется и `byte_at(pos - 2)` не паникует.
-    pub fn insert(&mut self, window: &SlidingWindow, pos: u64) {
-        if pos < 2 {
-            return;
-        }
-        if window.available_after(pos - 2) < 3 {
-            return;
-        }
-        let b0 = window.byte_at(pos);
-        let b1 = window.byte_at(pos - 1);
-        let b2 = window.byte_at(pos - 2);
-        let h = Self::hash3(b0, b1, b2);
-        let slot = (pos as usize) % self.window_size;
-        self.prev[slot] = self.head[h];
-        self.head[h] = pos;
-    }
-
-    /// Итератор по кандидатам `b` (КОНЕЦ обратного региона в окне),
-    /// упорядоченным от самых свежих к самым старым. Останавливается,
-    /// когда очередная позиция уходит за границу `window_start`.
-    fn candidates(
-        &self,
-        window: &SlidingWindow,
-        pos: u64,
-        window_start: u64,
-    ) -> impl Iterator<Item = u64> + '_ {
-        let (b0, b1, b2) = (
-            window.byte_at(pos),
-            window.byte_at(pos + 1),
-            window.byte_at(pos + 2),
-        );
-        let h = Self::hash3(b0, b1, b2);
-        let mut cur = self.head[h];
-        let window_size = self.window_size;
-        let prev = &self.prev;
-        std::iter::from_fn(move || {
-            if cur == NONE || cur < window_start {
-                return None;
-            }
-            let result = cur;
-            cur = prev[(cur as usize) % window_size];
-            Some(result)
-        })
-    }
-
-    /// No-op. Нужен для симметрии с API HashChain: устаревшие записи
-    /// отфильтровываются в `candidates` по `window_start`, а `prev`
-    /// использует модульную индексацию и перезаписывается естественным
-    /// образом на каждом insert.
-    pub fn trim_if_needed(&mut self, _pos: u64) {}
-}
-
-
-// =====================================================================
-// НОВОЕ: поиск ОБРАТНЫХ совпадений (используется в lzss_new.rs)
-// =====================================================================
-//
-// Всё выше этой черты - неизменная существующая реализация. Ниже -
-// единственная добавленная функция, использующая уже существующую
-// структуру `ReverseChain` (она была объявлена в файле раньше, но без
-// собственного алгоритма поиска - только индексация). Симметрична
-// `find_longest_match` выше, но:
-//   - использует `ReverseChain` вместо `HashChain`;
-//   - сравнивает байты окна в УБЫВАЮЩЕМ порядке индексов против входных
-//     данных в ВОЗРАСТАЮЩЕМ порядке (см. схему в комментарии к
-//     `ReverseChain`), а не два среза в одном и том же порядке;
-//   - обязана дополнительно ограничивать длину физической границей
-//     буфера ПОЗАДИ кандидата (`available_before`) - обратное совпадение,
-//     в отличие от прямого, не может самоссылаться в ещё не
-//     декодированные байты (весь исходный фрагмент лежит строго в уже
-//     пройденной истории), поэтому у него нет права "занимать" данные
-//     резервированием произвольной длины - оно жёстко ограничено тем,
-//     что физически ещё есть в буфере слева от кандидата.
-
-impl SlidingWindow {
-    /// Сколько байт "истории" физически ещё присутствует в буфере ДО и
-    /// ВКЛЮЧАЯ позицию `pos` (т.е. `pos - base_pos + 1`), с учётом уже
-    /// выполненных подрезок `trim_if_needed`. Нужно только для поиска
-    /// обратных совпадений - см. комментарий к `find_longest_reverse_match`.
-    pub fn available_before(&self, pos: u64) -> usize {
-        (pos.saturating_sub(self.base_pos) + 1) as usize
-    }
-}
-
-

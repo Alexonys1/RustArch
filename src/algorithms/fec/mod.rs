@@ -1,7 +1,5 @@
-mod hamming;
 mod reed_solomon;
 
-pub use hamming::HammingCode;
 pub use reed_solomon::ReedSolomonCode;
 
 use crate::error::AppError;

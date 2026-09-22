@@ -24,8 +24,8 @@ fn TEST_1_Huffman_NoCipher_NoFec_pack_and_unpack() { // TODO: Это отлич�
     let unpack_path = TEST1.get_unpack_path();
 
     // =================> ACTION: (неужели я начал писать тесты?) :D
-    let _ = run_pack(source_path.to_str().unwrap(), target_archive_path.to_str().unwrap(), settings, &encode_key);
-    let _ = run_unpack(target_archive_path.to_str().unwrap(), unpack_path.to_str().unwrap(), &encode_key);
+    let _ = run_pack(&source_path, &target_archive_path, settings, &encode_key);
+    let _ = run_unpack(&target_archive_path, &unpack_path, &encode_key);
 
     // ===================> ASSERT:
     let crc32_of_source = crc32_from_dir(&source_path);
@@ -53,8 +53,8 @@ fn TEST_2_Huffman_NoCipher_NoFec_pack_and_unpack() { // TODO: Это отлич�
     let unpack_path = TEST2.get_unpack_path();
 
     // =================> ACTION: (неужели я начал писать тесты?) :D
-    let _ = run_pack(source_path.to_str().unwrap(), target_archive_path.to_str().unwrap(), settings, &encode_key);
-    let _ = run_unpack(target_archive_path.to_str().unwrap(), unpack_path.to_str().unwrap(), &encode_key);
+    let _ = run_pack(&source_path, &target_archive_path, settings, &encode_key);
+    let _ = run_unpack(&target_archive_path, &unpack_path, &encode_key);
 
     // ===================> ASSERT:
     let crc32_of_source = crc32_from_dir(&source_path);

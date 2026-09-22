@@ -1,11 +1,12 @@
 use std::path::{Path, PathBuf};
 
+use crate::archiver::ArchivedDirectoryEntry;
 use crate::error::AppError;
 
 
-pub fn create_empty_dirs(root: &Path, target_empty_dirs: Vec<String>) -> Result<(), AppError> {
-    for empty_dir in target_empty_dirs.into_iter() {
-        let absolute_path = resolve_output_path(root, &empty_dir)?;
+pub fn create_empty_dirs(root: &Path, target_empty_dirs: &[ArchivedDirectoryEntry]) -> Result<(), AppError> {
+    for empty_dir in target_empty_dirs {
+        let absolute_path = resolve_output_path(root, &empty_dir.relative_path)?;
         std::fs::create_dir_all(&absolute_path)?;
     }
 

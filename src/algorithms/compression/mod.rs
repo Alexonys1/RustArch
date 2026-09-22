@@ -1,18 +1,17 @@
 mod rle;
 mod deflate;
-mod lz;
 mod utils;
 mod huffman;
+mod lzss;
 
 pub use deflate::DeflateCompressor;
 pub use huffman::HuffmanCompressor;
-pub use lz::Lz77Compressor;
-pub use lz::LzssCompressor;
+pub use lzss::LzssCompressor;
 pub use rle::RleCompressor;
 
+use super::ids::CompressionId;
 use crate::archiver::Artifact;
 use crate::error::AppError;
-use super::ids::CompressionId;
 
 
 pub trait Compressor {

@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 
+use crate::archiver::ArchivedDirectoryEntry;
 use crate::error::AppError;
 
 
@@ -13,7 +14,7 @@ pub struct WalkedFile {
 
 pub struct WalkResult {
     pub files: Vec<WalkedFile>,
-    pub empty_dirs: Vec<String>,
+    pub empty_dirs: Vec<ArchivedDirectoryEntry>,
 }
 
 
@@ -43,9 +44,10 @@ pub fn walk_directory_or_file<RootPath: AsRef<Path> + ?Sized>(root: &RootPath) -
 
 
 fn walk_recursive(
-    root: &Path, current: &Path,
+    root: &Path, 
+    current: &Path,
     files: &mut Vec<WalkedFile>,
-    empty_dirs: &mut Vec<String>
+    empty_dirs: &mut Vec<ArchivedDirectoryEntry>
 ) -> Result<(), AppError>
 {
     let mut saw_any_entry = false;
@@ -78,7 +80,9 @@ fn walk_recursive(
         let relative_path = current
             .strip_prefix(root)
             .expect("Путь всегда должен быть внутри root!");
-        empty_dirs.push(convert_to_platform_undepended_path(&relative_path));
+        empty_dirs.push(
+            ArchivedDirectoryEntry::new(convert_to_platform_undepended_path(&relative_path))
+        );
     }
 
     Ok(())

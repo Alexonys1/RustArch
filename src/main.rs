@@ -1,101 +1,130 @@
-use RustArch::cli::{ CLICommand, run_pack, run_unpack };
-use RustArch::algorithms::{ CipherId, CompressionId, FecId, PipelineSettings };
+use std::path::Path;
+use std::time::Instant;
+
+use RustArch::algorithms::{CipherId, CompressionId, FecId, PipelineSettings};
+use RustArch::cli::{CLICommand, parse_args, run_command};
+use RustArch::error::AppError;
+
+
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+enum QuickRunMode {
+    Pack,
+    Unpack,
+    TestGrouping,
+    Release,
+}
+
+const QUICK_SETTINGS: PipelineSettings = PipelineSettings {
+    compression: CompressionId::Huffman, // <========================================
+    cipher: CipherId::NoCipher, // <========================================
+    fec: FecId::NoFec, // <========================================
+};
+
+
+const QUICK_RUN_MODE: QuickRunMode = QuickRunMode::Release; // <==============================
+const QUICK_SOURCE_PATH: &str = r"C:\Games\Battlefield 2142 Novgames RST";
+const QUICK_ARCHIVE_PATH: &str = r".\test_data_for_removing\study.arch";
+const QUICK_UNPACK_PATH: &str = r".\test_data_for_removing\unpacked";
+const QUICK_WORKERS_FOR_GROUPING: usize = 16;
 
 
 fn main() {
-    /*let args: Vec<String> = std::env::args().skip(1).collect();
+    let cli_command: CLICommand = match QUICK_RUN_MODE {
+        QuickRunMode::Pack => quick_pack_command(),
 
-    let cli_command = match parse_args(&args) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("Ошибка: {e}");
-            print_help();
-            std::process::exit(1);
-        }
-    };
-     */
+        QuickRunMode::Unpack => quick_unpack_command(),
 
-    // ========== Для теста: ==========
-
-    enum TestCLICommand { Pack, Unpack, TestGrouping }
-    let test_choice = TestCLICommand::Pack; // !МЕНЯТЬ ЗДЕСЬ!   <==========================
-    const SOURCE_PATH:         &str = r"C:\Users\alex\Desktop\Тестовые данные для архиватора\Смешанное\Фото + Текст";
-    const TARGET_ARCHIVE_PATH: &str = r".\test_data_for_removing\study.arch";
-    const UNPACK_PATH:         &str = r".\test_data_for_removing\unpacked";
-
-
-    let cli_command: CLICommand = match test_choice {
-        TestCLICommand::Pack => CLICommand::Pack {
-            source_path: SOURCE_PATH.into(), // Важно, что эти относительные пути именно строки,
-            target_archive_path: TARGET_ARCHIVE_PATH.into(), // которые можно менять
-            settings: PipelineSettings {
-                compression: CompressionId::Deflate,
-                cipher: CipherId::NoCipher,
-                fec: FecId::NoFec,
-            },
-            encode_key: (1..=255).collect(), // Подбирать 255-БАЙТНЫЙ ключ полным перебором - это увлекательное дело!
-        },
-
-        TestCLICommand::Unpack => CLICommand::Unpack {
-            source_path: TARGET_ARCHIVE_PATH.into(),
-            target_unpack_path: UNPACK_PATH.into(),
-            decode_key: (1..=255).collect(),
-        },
-
-        TestCLICommand::TestGrouping => {
-            use RustArch::archiver::{ group_files_for_workers, walk_directory_or_file, WalkedFile };
-
-            let start = std::time::Instant::now();
-            let walked_files: Vec<WalkedFile> = walk_directory_or_file(SOURCE_PATH).unwrap().files;
-            let groups: Vec<Vec<&WalkedFile>> = group_files_for_workers(&walked_files, 16).unwrap();
-            let elapsed = start.elapsed();
-
-            println!("Walked {:#?} files", groups);
-
-            for group in groups {
-                println!(
-                    "Files in group: {}\tTotal group size: {}",
-                    group.len(),
-                    group.iter().map(|f| f.get_size().unwrap()).sum::<u64>()
-                );
+        QuickRunMode::TestGrouping => {
+            if let Err(error) = run_quick_grouping() {
+                eprintln!("Ошибка: {error}");
+                std::process::exit(1);
             }
-
-            println!("Time of walking and grouping: {}ms", elapsed.as_millis());
-
-            std::process::exit(0);
+            return;
         }
 
+        QuickRunMode::Release => match parse_args(std::env::args_os().skip(1)) {
+            Ok(command) => command,
+            Err(error) => {
+                eprintln!("Ошибка: {error}");
+                eprintln!("Используйте 'RustArch --help' для справки.");
+                std::process::exit(2);
+            }
+        }
     };
 
-    let start = std::time::Instant::now();
-    let archive_result = match cli_command {
-        CLICommand::Pack {
-            source_path,
-            target_archive_path,
-            settings,
-            encode_key,
-        } => run_pack(&source_path, &target_archive_path, settings, &encode_key),
-
-        CLICommand::Unpack {
-            source_path,
-            target_unpack_path,
-            decode_key,
-        } => run_unpack(&source_path, &target_unpack_path, &decode_key),
-
-        _ => todo!(),
-    };
+    let start = Instant::now();
+    let execution_result = run_command(cli_command.clone());
     let elapsed = start.elapsed();
 
-    let archive_size_in_gb: f64 = std::fs::metadata(r"C:\Users\alex\RustroverProjects\RustArch\test_data_for_removing\study.arch")
-        .unwrap().len() as f64 / 1024_f64.powi(3);
-
     println!("\n===> TOTAL TIME: {}ms", elapsed.as_millis());
-    println!(  "===> TOTAL SIZE: {:.2}GB", archive_size_in_gb);
 
-    if let Err(e) = archive_result {
-        eprintln!("Ошибка: {e}");
+    if let Err(error) = execution_result {
+        eprintln!("Ошибка: {error}");
         std::process::exit(1);
     }
 
-    //let _ = gui::run();
+    match cli_command {
+        CLICommand::Pack { target_archive_path, .. } => {
+            match std::fs::metadata(&target_archive_path) {
+                Ok(metadata) => println!(
+                    "===> TOTAL SIZE: {:.2} GiB ({} bytes)",
+                    metadata.len() as f64 / 1024_f64.powi(3),
+                    metadata.len(),
+                ),
+
+                Err(error) => eprintln!(
+                    "Предупреждение: не удалось прочитать размер '{}': {error}",
+                    target_archive_path.display()
+                ),
+            }
+        }
+
+        _ => { }
+    }
+}
+
+
+// ===================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ БЫСТРОГО ТЕСТИРОВАНИЯ =========================
+// Очень лень писать скрипты с разными командами для архиватора...
+fn quick_pack_command() -> CLICommand {
+    CLICommand::Pack {
+        source_path: QUICK_SOURCE_PATH.into(),
+        target_archive_path: QUICK_ARCHIVE_PATH.into(),
+        settings: QUICK_SETTINGS,
+        encode_key: (1..=255).collect(),
+    }
+}
+
+fn quick_unpack_command() -> CLICommand {
+    CLICommand::Unpack {
+        source_path: QUICK_ARCHIVE_PATH.into(),
+        target_unpack_path: QUICK_UNPACK_PATH.into(),
+        decode_key: (1..=255).collect(),
+    }
+}
+
+fn run_quick_grouping() -> Result<(), AppError> {
+    use RustArch::archiver::{WalkedFile, group_files_for_workers, walk_directory_or_file};
+
+    let started = Instant::now();
+    let walked_files: Vec<WalkedFile> = walk_directory_or_file(Path::new(QUICK_SOURCE_PATH))?.files;
+    let groups = group_files_for_workers(&walked_files, QUICK_WORKERS_FOR_GROUPING)?;
+
+    println!("Групп: {}", groups.len());
+    for (index, group) in groups.iter().enumerate() {
+        let total_size = group.iter().try_fold(0u64, |sum, file| {
+            file.get_size().map(|size| sum.saturating_add(size))
+        })?;
+        println!(
+            "Группа #{:<2}: {:>6} файлов, {:>12} байт",
+            index + 1,
+            group.len(),
+            total_size,
+        );
+    }
+
+    println!("Время группировки: {}ms", started.elapsed().as_millis());
+
+    Ok(())
 }

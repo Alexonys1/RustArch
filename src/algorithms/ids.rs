@@ -9,14 +9,13 @@ pub enum CompressionId {
     NoCompression = 0,
     RLE = 1,
     Huffman = 2,
-    LZ77 = 3,
-    LZSS = 4,
-    Deflate = 5,
+    LZSS = 3,
+    Deflate = 4,
 }
 
 
 impl CompressionId {
-    pub fn as_u8(self) -> u8 {
+    pub const fn as_u8(self) -> u8 {
         self as u8
     }
 
@@ -26,7 +25,6 @@ impl CompressionId {
             NoCompression => Box::new(compression::NoneCompressor),
             RLE => Box::new(compression::RleCompressor),
             Huffman => Box::new(compression::HuffmanCompressor),
-            LZ77 => Box::new(compression::Lz77Compressor),
             LZSS => Box::new(compression::LzssCompressor),
             Deflate => Box::new(compression::DeflateCompressor),
         }
@@ -38,12 +36,21 @@ impl CompressionId {
             0 => Ok(NoCompression),
             1 => Ok(RLE),
             2 => Ok(Huffman),
-            3 => Ok(LZ77),
-            4 => Ok(LZSS),
-            5 => Ok(Deflate),
+            3 => Ok(LZSS),
+            4 => Ok(Deflate),
             other => Err(AppError::CorruptArchive(format!(
                 "Неизвестный compression_id: {other}"
             ))),
+        }
+    }
+    
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            CompressionId::NoCompression => "none",
+            CompressionId::RLE => "rle",
+            CompressionId::Huffman => "huffman",
+            CompressionId::LZSS => "lzss",
+            CompressionId::Deflate => "deflate",
         }
     }
 }
@@ -56,7 +63,7 @@ pub enum CipherId {
 }
 
 impl CipherId {
-    pub fn as_u8(self) -> u8 {
+    pub const fn as_u8(self) -> u8 {
         self as u8
     }
 
@@ -78,19 +85,24 @@ impl CipherId {
             ))),
         }
     }
+    
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            CipherId::NoCipher => "none",
+            CipherId::Xor => "xor",
+        }
+    }
 }
 
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FecId {
     NoFec = 0,
-    Hamming7_4 = 1,
-    Hamming15_11 = 2,
-    ReedSolomon = 3,
+    ReedSolomon = 1,
 }
 
 impl FecId {
-    pub fn as_u8(self) -> u8 {
+    pub const fn as_u8(self) -> u8 {
         self as u8
     }
 
@@ -98,7 +110,6 @@ impl FecId {
         use FecId::*;
         match self {
             NoFec => Box::new(fec::NoneFec),
-            Hamming7_4 | Hamming15_11 => todo!(),
             ReedSolomon => Box::new(fec::ReedSolomonCode),
         }
     }
@@ -107,12 +118,17 @@ impl FecId {
         use FecId::*;
         match v {
             0 => Ok(NoFec),
-            1 => Ok(Hamming7_4),
-            2 => Ok(Hamming15_11),
-            3 => Ok(ReedSolomon),
+            1 => Ok(ReedSolomon),
             other => Err(AppError::CorruptArchive(format!(
                 "Неизвестный fec_id: {other}"
             ))),
+        }
+    }
+    
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            FecId::NoFec => "none",
+            FecId::ReedSolomon => "reed-solomon",
         }
     }
 }

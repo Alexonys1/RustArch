@@ -1,15 +1,17 @@
 use std::path::Path;
 
-use crate::algorithms::{Cipher, Compressor, ErrorCorrectionCode};
-use crate::archiver::{Artifact, ArchiveEntry, crc32_of_artifact_and_rewind, resolve_output_path};
 use crate::error::AppError;
+use crate::algorithms::{Cipher, Compressor, ErrorCorrectionCode};
+use crate::archiver::{
+    ArchivedArtifactEntry, Artifact, crc32_of_artifact_and_rewind, resolve_output_path,
+};
 
 
 /// fec-decode -> decrypt -> decompress.
 /// Pipeline берётся из самой записи: разные файлы одного архива могут
 /// использовать разные алгоритмы сжатия.
 pub fn unpack_file(
-    entry: &ArchiveEntry,
+    entry: &ArchivedArtifactEntry,
     archive_path: &Path,
     output_dir: &Path,
     decode_key: &[u8],
@@ -17,20 +19,11 @@ pub fn unpack_file(
 {
     let output_path = resolve_output_path(output_dir, &entry.relative_path)?;
 
-    if entry.is_directory {
-        std::fs::create_dir_all(&output_path)?;
-        return Ok(());
-    }
-
     if let Some(parent) = output_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
 
-    let windowed_artifact = Artifact::from_file_range(
-        archive_path,
-        entry.payload_offset,
-        entry.stored_size,
-    )?;
+    let windowed_artifact = Artifact::from_file_range(archive_path, entry.payload_offset, entry.stored_size)?;
 
     let fec: Box<dyn ErrorCorrectionCode> = entry.pipeline.fec.get();
     let cipher: Box<dyn Cipher> = entry.pipeline.cipher.get();

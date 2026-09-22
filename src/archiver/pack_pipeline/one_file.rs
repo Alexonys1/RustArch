@@ -1,10 +1,8 @@
 use std::sync::mpsc::Sender;
 
-use crate::algorithms::{Cipher, ErrorCorrectionCode, PipelineSettings, CompressionId, Compressor};
-use crate::archiver::{crc32_of_artifact_and_rewind, Artifact, WalkedFile, ArchivedArtifactEntry};
+use crate::algorithms::{Cipher, Compressor, ErrorCorrectionCode, PipelineSettings};
+use crate::archiver::{ArchivedArtifactEntry, Artifact, WalkedFile, crc32_of_artifact_and_rewind};
 use crate::error::AppError;
-
-const IS_OPTIMIZE_ON: bool = true;
 
 
 /// compress -> encrypt -> fec-encode
@@ -21,27 +19,28 @@ pub fn pack_file(
 {
     let mut artifact = Artifact::from_file(file.absolute_path.as_ref())?;
 
-    let original_size = artifact.get_payload_size() as u64;
-    let crc32 = crc32_of_artifact_and_rewind(&mut artifact, pipeline_settings)?;
+    let original_size: u64 = artifact.get_payload_size() as u64;
+    let crc32: u32 = crc32_of_artifact_and_rewind(&mut artifact, pipeline_settings)?;
 
+    let compressor: Box<dyn Compressor> = pipeline_settings.compression.get();
     let cipher: Box<dyn Cipher> = pipeline_settings.cipher.get();
     let fec: Box<dyn ErrorCorrectionCode> = pipeline_settings.fec.get();
 
-    let (compressed_artifact, effective_compressor_id) = compress_with_fallback(artifact, pipeline_settings.compression)?;
+    let (compressed_artifact, effective_compression) = compressor.compress(artifact)?;
     let encoded_artifact = cipher.transform(compressed_artifact, encode_key)?;
     let cooked_artifact = fec.encode(encoded_artifact)?;
 
-    let size_after_pipeline = cooked_artifact.get_payload_size() as u64;
+    let stored_size: u64 = cooked_artifact.get_payload_size() as u64;
+    let effective_pipeline = PipelineSettings {
+        compression: effective_compression,
+        ..pipeline_settings
+    };
     let entry = ArchivedArtifactEntry {
         relative_path: file.relative_path.clone(),
         original_size,
-        size_after_pipeline,
+        stored_size,
         payload_offset: 0,
-        pipeline: PipelineSettings {
-            compression: effective_compressor_id,
-            cipher: pipeline_settings.cipher,
-            fec: pipeline_settings.fec,
-        },
+        pipeline: effective_pipeline,
         crc32,
     };
 
@@ -50,20 +49,4 @@ pub fn pack_file(
         .map_err(|_| AppError::Compression("Очередь записи архива недоступна".into()))?;
 
     Ok(())
-}
-
-
-fn compress_with_fallback(
-    artifact: Artifact,
-    original_compressor_id: CompressionId,
-) -> Result<(Artifact, CompressionId), AppError>
-{
-    if original_compressor_id == CompressionId::NoCompression {
-        return Ok((artifact, original_compressor_id));
-    }
-
-    let compressor: Box<dyn Compressor> = original_compressor_id.get();
-    let (compressed_artifact, effective_compressor_id) = compressor.compress(artifact)?;
-
-    Ok((compressed_artifact, effective_compressor_id))
 }

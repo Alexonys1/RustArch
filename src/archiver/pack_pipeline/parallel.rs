@@ -1,6 +1,6 @@
+use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::sync::mpsc::Sender;
-use std::cmp::Reverse;
 use std::thread;
 
 use crate::algorithms::PipelineSettings;
@@ -25,12 +25,14 @@ pub fn pack_files_parallel(
 
         for file_group in &groups_of_files {
             workers.push(scope.spawn(|| {
-                start_packing_file_group(file_group, pipeline_settings, encode_key, artifact_sender.clone())
+                pack_file_group(file_group, pipeline_settings, encode_key, artifact_sender.clone())
             }));
         }
 
         for worker in workers {
-            worker.join().map_err(|_| AppError::Compression("Паника в рабочем потоке".into()))??;
+            worker
+                .join()
+                .map_err(|_| AppError::Compression("Паника в рабочем потоке".into()))??;
         }
 
         Ok(())
@@ -38,12 +40,13 @@ pub fn pack_files_parallel(
 }
 
 
-fn start_packing_file_group(
+fn pack_file_group(
     file_group: &[&WalkedFile],
     pipeline_settings: PipelineSettings,
     encode_key: &[u8],
     artifact_sender: Sender<(ArchivedArtifactEntry, Artifact)>,
-) -> Result<(), AppError> {
+) -> Result<(), AppError>
+{
     for file in file_group {
         pack_file(file, pipeline_settings, encode_key, artifact_sender.clone())?
     }

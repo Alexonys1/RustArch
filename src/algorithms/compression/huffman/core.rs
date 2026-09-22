@@ -192,14 +192,14 @@ impl HuffmanCompressor {
         let tree: NodeOfHuffmanTree = build_tree(&nonzero_freqs);
         let codes: [HuffmanCode; ALPHABET_SIZE] = create_huffman_codes(tree);
 
-        let header_bytes: u64 = 8 + 2 + nonzero_freqs.len() as u64 * 9;
-        let encoded_bits: u64 = nonzero_freqs
+        let header_bytes = 8u128 + 2 + nonzero_freqs.len() as u128 * 9;
+        let encoded_bits: u128 = nonzero_freqs
             .iter()
-            .map(|entry| codes[entry.symbol as usize].len as u64 * entry.freq)
+            .map(|entry| codes[entry.symbol as usize].len as u128 * entry.freq as u128)
             .sum();
         let encoded_size = header_bytes + encoded_bits.div_ceil(8);
 
-        if allow_passthrough && encoded_size >= original_size {
+        if allow_passthrough && encoded_size >= original_size as u128 {
             return Ok((artifact, CompressionId::NoCompression));
         }
 

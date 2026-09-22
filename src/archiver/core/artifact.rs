@@ -7,7 +7,6 @@ use std::num::NonZeroUsize;
 use std::borrow::Cow;
 
 use crate::error::AppError;
-use crate::algorithms::PipelineSettings;
 use super::memory_budget::BudgetGuard;
 
 
@@ -23,17 +22,6 @@ pub struct Artifact {
     is_temp_file: bool,
     reading_position: usize,
     writing_position: usize,
-}
-
-
-#[derive(Debug, Clone)]
-pub struct ArchivedArtifactEntry {
-    pub relative_path: String,
-    pub original_size: u64,
-    pub size_after_pipeline: u64,
-    pub payload_offset: u64,
-    pub pipeline: PipelineSettings,
-    pub crc32: u32,
 }
 
 
@@ -439,19 +427,19 @@ impl Drop for Artifact {
             ArtifactState::File { .. } => {
                 if self.is_temp_file {
                     let path: &Path = self.file_path.as_ref();
-                    let result: io::Result<()> = fs::remove_file(path);
+                    let _result: io::Result<()> = fs::remove_file(path);
                     //println!("The artifact [FILE] has been removed: {:?}. Path: {:?}", result, self.file_path);
                 } else {
                     //println!("The artifact [FILE] has been dropped, but the file is still exists. Path: {:?}", self.file_path);
                 }
             }
 
-            ArtifactState::Memory { data, .. } => {
+            ArtifactState::Memory { data: _data, .. } => {
                 //println!("The artifact [MEMORY]  has been dropped: {} bytes", data.len());
                 //super::memory_budget::show_memory_bar();
             }
 
-            ArtifactState::FileWindow { len, .. } => {
+            ArtifactState::FileWindow { len: _len, .. } => {
                 //println!("The artifact [FILE WINDOW] has been dropped: {} bytes", len);
             }
         }
