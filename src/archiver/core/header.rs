@@ -19,7 +19,7 @@ use crate::error::AppError;
 
 
 pub const MAGIC: [u8; 4] = *b"RARC";
-pub const FORMAT_VERSION: u16 = 3;
+pub const FORMAT_VERSION: u16 = 4;
 pub const FOOTER_SIZE: u64 = 32;
 
 

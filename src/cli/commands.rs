@@ -1,6 +1,6 @@
 use std::ffi::{OsStr, OsString};
-use std::fs;
 use std::path::PathBuf;
+use std::fs;
 
 use crate::algorithms::{CipherId, CompressionId, FecId, PipelineSettings};
 use crate::error::AppError;

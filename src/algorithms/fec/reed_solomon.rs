@@ -29,31 +29,22 @@
 //!   многочлен-оценщик ошибок (`S(x)*Λ(x) mod x^nsym`), а Λ'(x) -
 //!   формальная производная локатора.
 //!
-//! # Объём избыточности (nsym) зависит от размера файла
+//! # Формат блоков
 //!
-//! Один блок RS над GF(256) не может быть длиннее 255 символов
-//! (`k + nsym <= 255` - это математическое ограничение поля, а не выбор
-//! реализации), и может исправить не больше `nsym / 2` ошибочных байт
-//! НА БЛОК. Чем меньше `k` (данных на блок) при фиксированном размере
-//! блока `n <= 255` - т, тем БОЛЬШЕ `nsym` (чётности) и тем выше степень
-//! защиты, но тем больше итоговое раздутие файла (в пределе `k=1` -
-//! каждый байт защищён 254 байтами чётности, файл раздувается в 255 раз).
-//! Поэтому мы не можем просто всегда брать `nsym` по максимуму - для
-//! большого файла это дало бы астрономический размер архива. Вместо
-//! этого размер блока подбирается по общему размеру файла
-//! (`choose_parameters`): чем МЕНЬШЕ файл, тем БОЛЬШУЮ степень защиты
-//! (в пределе - вплоть до максимально возможной для одного блока) он
-//! может себе позволить при разумном абсолютном расходе места, а для
-//! больших файлов используется меньшая (но всё ещё существенная) доля
-//! чётности, чтобы раздутие оставалось практичным. Самый крупный уровень
-//! (k=223, nsym=32) - это в точности параметры RS(255,223) из стандарта
-//! CCSDS для дальней космической связи, десятилетиями проверенные на
-//! практике как разумный компромисс.
+//! Каждый полный блок использует профиль RS(255,223): 223 информационных
+//! символа и 32 символа чётности, что позволяет исправить до 16 ошибочных
+//! символов. Последний блок кодируется в укороченной форме: к оставшимся
+//! `1..=222` информационным символам добавляются те же 32 символа чётности.
+//! Благодаря этому длина исходных данных однозначно выводится из длины
+//! закодированного [`Artifact`], и отдельный заголовок размера не требуется.
+//! Параметры поля и корни порождающего многочлена остаются внутренним
+//! форматом RustArch; совместимость с битовым представлением CCSDS здесь
+//! не заявляется.
 //!
 //! # Память
 //!
 //! Блоки RS независимы друг от друга (как и блоки Хэмминга), поэтому
-//! файл обрабатывается потоково через `Artifact::read_chunk`/`write_chunk_from`
+//! файл обрабатывается потоково через `Artifact::read_chunk_to`/`write_chunk_from`
 //! блок за блоком, без чтения файла в память целиком. Буферы одного
 //! блока (`k`/`n <= 255` байт) выделяются ОДИН РАЗ перед циклом и
 //! переиспользуются на каждой итерации; таблицы поля (`Gf256`) и
@@ -75,6 +66,9 @@ const GF_GENZ_ERATOR_POLY: u16 = 0x11D;
 /// Порог сброса накопленного выходного буфера в артефакт - ограничивает
 /// пиковую дополнительную память константой, а не размером файла.
 const OUTPUT_FLUSH_SIZE: usize = 512 * 1024;
+const DATA_SYMBOLS: usize = 223;
+const PARITY_SYMBOLS: usize = 32;
+const CODEWORD_SYMBOLS: usize = DATA_SYMBOLS + PARITY_SYMBOLS;
 
 
 /// Поле Галуа GF(256) с примитивным элементом 2. Таблицы строятся один
@@ -386,6 +380,9 @@ fn decode_block(gf: &Gf256, codeword: &mut [u8], nsym: usize) -> BlockStatus {
         .collect();
 
     if syndromes.iter().all(|&s| s == 0) {
+        // Нулевой синдром подтверждает принадлежность принятого слова коду,
+        // но принципиально не отличает исходное слово от другого допустимого
+        // кодового слова. По принятому решению отдельная CRC здесь не хранится.
         return BlockStatus::Ok;
     }
 
@@ -453,73 +450,29 @@ fn fill_exact(artifact: &mut Artifact, buf: &mut [u8]) -> Result<(), AppError> {
 
 pub struct ReedSolomonCode;
 
-impl ReedSolomonCode {
-    /// Подбирает (k, nsym) - число байт данных и чётности на один блок -
-    /// по общему размеру файла. Один блок RS(256) не может быть длиннее
-    /// 255 байт, поэтому чем меньше файл, тем БОЛЬШУЮ долю блока можно
-    /// без сожаления отдать под чётность (абсолютный расход места всё
-    /// равно останется небольшим); для крупных файлов доля чётности
-    /// снижается, чтобы раздутие оставалось практичным - см. подробное
-    /// объяснение в комментарии к модулю.
-    fn choose_parameters(original_size: u64) -> (usize, usize) {
-        const KIB: u64 = 1024;
-        const MIB: u64 = 1024 * KIB;
-
-        if original_size <= 254 {
-            // Единственный блок на весь файл - используем всё, что
-            // осталось от 255-символьного блока, под чётность:
-            // максимально возможная защита для файлов такого размера.
-            let k = (original_size as usize).max(1);
-            return (k, 255 - k);
-        }
-        if original_size <= 64 * KIB {
-            (63, 192) // ~75% блока - чётность
-        } else if original_size <= MIB {
-            (127, 128) // ровно половина блока - чётность
-        } else if original_size <= 16 * MIB {
-            (191, 64) // ~25% блока - чётность
-        } else {
-            // Параметры RS(255,223) - практический промышленный стандарт
-            // (в т.ч. CCSDS для дальней космической связи), разумный
-            // компромисс между защитой и раздутием для больших файлов.
-            (223, 32)
-        }
-    }
-}
-
 impl ErrorCorrectionCode for ReedSolomonCode {
     fn encode(&self, mut artifact: Artifact) -> Result<Artifact, AppError> {
-        let original_size = artifact.get_payload_size() as u64;
-        let (k, nsym) = Self::choose_parameters(original_size);
-
-        if k == 0 || nsym == 0 || k + nsym > 255 {
-            return Err(AppError::Fec(format!(
-                "Reed-Solomon: недопустимые параметры блока (k={k}, nsym={nsym}) - k+nsym должно быть в 1..=255"
-            )));
-        }
-
         let gf = Gf256::new();
-        let genz = build_genzerator(&gf, nsym);
+        let genz = build_genzerator(&gf, PARITY_SYMBOLS);
 
         let mut output = Artifact::new_with_temp_file_suffix(&artifact, "fec_encoded");
-        output.write_chunk_from(&original_size.to_le_bytes())?;
 
         // Буфер ровно на один блок данных - выделяется один раз и
         // переиспользуется на каждой итерации, память не зависит от
         // размера файла.
-        let mut data_buf = vec![0u8; k];
+        let mut data_buf = [0u8; DATA_SYMBOLS];
         let mut filled = 0usize;
         let mut out_buf: Vec<u8> = Vec::with_capacity(OUTPUT_FLUSH_SIZE);
 
         while let Some(chunk) = artifact.next_chunk()? {
             let mut chunk_pos = 0;
             while chunk_pos < chunk.len() {
-                let take = (k - filled).min(chunk.len() - chunk_pos);
+                let take = (DATA_SYMBOLS - filled).min(chunk.len() - chunk_pos);
                 data_buf[filled..filled + take].copy_from_slice(&chunk[chunk_pos..chunk_pos + take]);
                 filled += take;
                 chunk_pos += take;
 
-                if filled == k {
+                if filled == DATA_SYMBOLS {
                     let codeword = rs_encode_block(&gf, &data_buf, &genz);
                     out_buf.extend_from_slice(&codeword);
                     filled = 0;
@@ -533,12 +486,9 @@ impl ErrorCorrectionCode for ReedSolomonCode {
         }
 
         if filled > 0 {
-            // Последний неполный блок дополняем нулями справа - декодер
-            // знает точный `original_size` и отбросит дополнение сам.
-            for byte in &mut data_buf[filled..] {
-                *byte = 0;
-            }
-            let codeword = rs_encode_block(&gf, &data_buf, &genz);
+            // Укороченный RS-блок сохраняет ровно оставшиеся данные и
+            // стандартное число символов чётности, без нулевого дополнения.
+            let codeword = rs_encode_block(&gf, &data_buf[..filled], &genz);
             out_buf.extend_from_slice(&codeword);
         }
 
@@ -550,39 +500,53 @@ impl ErrorCorrectionCode for ReedSolomonCode {
     }
 
     fn decode(&self, mut artifact: Artifact) -> Result<(Artifact, FecReport), AppError> {
-        let mut header = [0u8; 8];
-        fill_exact(&mut artifact, &mut header)?;
-        let original_size = u64::from_le_bytes(header);
+        let encoded_size = artifact.get_payload_size();
+        let full_blocks = encoded_size / CODEWORD_SYMBOLS;
+        let shortened_size = encoded_size % CODEWORD_SYMBOLS;
 
-        let (k, nsym) = Self::choose_parameters(original_size);
-        let n = k + nsym;
+        if shortened_size != 0 && shortened_size <= PARITY_SYMBOLS {
+            return Err(AppError::Fec(format!(
+                "Reed-Solomon: некорректная длина потока {encoded_size}: остаток блока {shortened_size} должен быть 0 или {}..={} байт",
+                PARITY_SYMBOLS + 1,
+                CODEWORD_SYMBOLS - 1,
+            )));
+        }
+
+        let blocks_count = full_blocks + usize::from(shortened_size != 0);
 
         let gf = Gf256::new();
 
         let mut output = Artifact::new_with_temp_file_suffix(&artifact, "fec_decoded");
         let mut report = FecReport::default();
 
-        let mut produced: u64 = 0;
         let mut out_buf: Vec<u8> = Vec::with_capacity(OUTPUT_FLUSH_SIZE);
-        // Буфер ровно на одно закодированное кодовое слово - переиспользуется
-        // на каждой итерации.
-        let mut block_buf = vec![0u8; n];
+        let mut block_buf = vec![0u8; CODEWORD_SYMBOLS];
 
-        while produced < original_size {
+        for block_index in 0..blocks_count {
+            let block_size = if block_index < full_blocks {
+                CODEWORD_SYMBOLS
+            } else {
+                shortened_size
+            };
+            let data_size = block_size - PARITY_SYMBOLS;
+            block_buf.resize(block_size, 0);
             fill_exact(&mut artifact, &mut block_buf)?;
 
-            let status = decode_block(&gf, &mut block_buf, nsym);
+            let status = decode_block(&gf, &mut block_buf, PARITY_SYMBOLS);
             report.blocks_processed += 1;
             match status {
                 BlockStatus::Ok => {}
                 BlockStatus::Corrected => report.blocks_corrected += 1,
-                BlockStatus::Uncorrectable => report.blocks_uncorrectable += 1,
+                BlockStatus::Uncorrectable => {
+                    return Err(AppError::Fec(format!(
+                        "Reed-Solomon: блок {} из {} содержит неисправимые ошибки",
+                        block_index + 1,
+                        blocks_count,
+                    )));
+                }
             }
 
-            let remaining = (original_size - produced) as usize;
-            let take = k.min(remaining);
-            out_buf.extend_from_slice(&block_buf[..take]);
-            produced += take as u64;
+            out_buf.extend_from_slice(&block_buf[..data_size]);
 
             if out_buf.len() >= OUTPUT_FLUSH_SIZE {
                 output.write_chunk_from(&out_buf)?;
@@ -599,5 +563,146 @@ impl ErrorCorrectionCode for ReedSolomonCode {
 
     fn id(&self) -> FecId {
         FecId::ReedSolomon
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::num::NonZeroUsize;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::*;
+
+    static TEST_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn source_artifact(data: &[u8]) -> (Artifact, PathBuf) {
+        let id = TEST_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "rustarch_rs_{}_{}.bin",
+            std::process::id(),
+            id,
+        ));
+        fs::write(&path, data).unwrap();
+        let mut artifact = Artifact::from_file(&path).unwrap();
+        artifact.chunk_size = NonZeroUsize::new(17).unwrap();
+        (artifact, path)
+    }
+
+    fn read_all(mut artifact: Artifact) -> Vec<u8> {
+        let mut result = Vec::new();
+        let mut buffer = [0u8; 19];
+        loop {
+            let read = artifact.read_chunk_to(&mut buffer).unwrap();
+            if read == 0 {
+                break;
+            }
+            result.extend_from_slice(&buffer[..read]);
+        }
+        result
+    }
+
+    fn test_data(size: usize) -> Vec<u8> {
+        (0..size)
+            .map(|index| ((index * 73 + index / 7 + 19) % 256) as u8)
+            .collect()
+    }
+
+    #[test]
+    fn artifact_round_trip_uses_full_and_shortened_blocks() {
+        let cases = [
+            (0, 0),
+            (1, 33),
+            (222, 254),
+            (223, 255),
+            (224, 288),
+            (445, 509),
+            (446, 510),
+        ];
+
+        for (source_size, encoded_size) in cases {
+            let source = test_data(source_size);
+            let (artifact, path) = source_artifact(&source);
+            let encoded = ReedSolomonCode.encode(artifact).unwrap();
+            fs::remove_file(path).unwrap();
+
+            assert_eq!(encoded.get_payload_size(), encoded_size);
+            let (decoded, report) = ReedSolomonCode.decode(encoded).unwrap();
+            assert_eq!(read_all(decoded), source);
+            assert_eq!(report.blocks_corrected, 0);
+            assert_eq!(report.blocks_uncorrectable, 0);
+        }
+    }
+
+    #[test]
+    fn corrects_up_to_sixteen_symbol_errors() {
+        for source_size in [1, DATA_SYMBOLS - 1, DATA_SYMBOLS] {
+            for errors_count in 1..=16 {
+                let source = test_data(source_size);
+                let (artifact, path) = source_artifact(&source);
+                let mut encoded = ReedSolomonCode.encode(artifact).unwrap();
+                fs::remove_file(path).unwrap();
+
+                let bytes = encoded.next_mut_chunk_from_memory().unwrap().unwrap();
+                for (index, byte) in bytes.iter_mut().take(errors_count).enumerate() {
+                    *byte ^= (index as u8).wrapping_add(1);
+                }
+                encoded.rewind_reading();
+
+                let (decoded, report) = ReedSolomonCode.decode(encoded).unwrap();
+                assert_eq!(read_all(decoded), source);
+                assert_eq!(report.blocks_processed, 1);
+                assert_eq!(report.blocks_corrected, 1);
+                assert_eq!(report.blocks_uncorrectable, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_uncorrectable_block() {
+        let source = test_data(DATA_SYMBOLS);
+        let (artifact, path) = source_artifact(&source);
+        let mut encoded = ReedSolomonCode.encode(artifact).unwrap();
+        fs::remove_file(path).unwrap();
+
+        let bytes = encoded.next_mut_chunk_from_memory().unwrap().unwrap();
+        for (index, byte) in bytes.iter_mut().take(17).enumerate() {
+            *byte ^= (index as u8).wrapping_add(1);
+        }
+        encoded.rewind_reading();
+
+        assert!(matches!(
+            ReedSolomonCode.decode(encoded),
+            Err(AppError::Fec(_)),
+        ));
+    }
+
+    #[test]
+    fn rejects_stream_too_short_for_parity() {
+        for size in 1..=PARITY_SYMBOLS {
+            let bytes = vec![0u8; size];
+            let (artifact, path) = source_artifact(&bytes);
+            let result = ReedSolomonCode.decode(artifact);
+            fs::remove_file(path).unwrap();
+            assert!(matches!(result, Err(AppError::Fec(_))), "size={size}");
+        }
+    }
+
+    #[test]
+    fn rejects_truncated_codeword() {
+        let source = test_data(DATA_SYMBOLS);
+        let (artifact, path) = source_artifact(&source);
+        let encoded = ReedSolomonCode.encode(artifact).unwrap();
+        fs::remove_file(path).unwrap();
+
+        let mut truncated = read_all(encoded);
+        truncated.pop();
+        let (artifact, path) = source_artifact(&truncated);
+        let result = ReedSolomonCode.decode(artifact);
+        fs::remove_file(path).unwrap();
+
+        assert!(matches!(result, Err(AppError::Fec(_))));
     }
 }

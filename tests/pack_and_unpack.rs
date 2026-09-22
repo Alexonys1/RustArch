@@ -1,9 +1,48 @@
 mod utils;
 
+use std::fs;
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use utils::*;
 
 use RustArch::cli::{run_pack, run_unpack};
 use RustArch::algorithms::{CipherId, CompressionId, FecId, PipelineSettings};
+
+
+static TEMP_TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+
+#[test]
+fn reed_solomon_pack_and_unpack_round_trip() {
+    let id = TEMP_TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!(
+        "rustarch_pipeline_rs_{}_{}",
+        std::process::id(),
+        id,
+    ));
+    let source_dir = root.join("source");
+    let source_file = source_dir.join("payload.bin");
+    let archive_path = root.join("payload.arch");
+    let unpack_dir = root.join("unpacked");
+    let source: Vec<u8> = (0..700)
+        .map(|index| ((index * 41 + index / 5 + 7) % 256) as u8)
+        .collect();
+
+    fs::create_dir_all(&source_dir).unwrap();
+    fs::write(&source_file, &source).unwrap();
+
+    let settings = PipelineSettings {
+        compression: CompressionId::NoCompression,
+        cipher: CipherId::NoCipher,
+        fec: FecId::ReedSolomon,
+    };
+
+    run_pack(&source_dir, &archive_path, settings, &[]).unwrap();
+    run_unpack(&archive_path, &unpack_dir, &[]).unwrap();
+
+    assert_eq!(fs::read(unpack_dir.join("payload.bin")).unwrap(), source);
+    fs::remove_dir_all(root).unwrap();
+}
 
 
 #[test]
