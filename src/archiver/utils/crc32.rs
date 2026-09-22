@@ -1,12 +1,4 @@
-//! Реализация CRC32 (полином IEEE 802.3, тот же, что в zip/png/ethernet).
-//!
-//! Нужен архиву для проверки целостности: контрольная сумма считается от
-//! ИСХОДНЫХ (несжатых, нешифрованных) данных файла и хранится в записи
-//! архива. После полной обратной цепочки (fec-decode -> decrypt ->
-//! decompress) распаковщик пересчитывает CRC32 результата и сравнивает их.
-//!
-//! Считается потоково (`update` можно вызывать многократно кусками),
-//! чтобы не требовать держать весь файл в памяти ради контрольной суммы.
+//! Реализация CRC32 (полином IEEE 802.3).
 
 use crate::algorithms::{PipelineSettings, CipherId};
 use crate::archiver::Artifact;
@@ -18,7 +10,7 @@ pub struct Crc32 {
 
 
 impl Crc32 {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self { state: 0xFFFF_FFFF }
     }
 
@@ -31,7 +23,7 @@ impl Crc32 {
         }
     }
 
-    pub fn finalize(self) -> u32 {
+    pub const fn finalize(self) -> u32 {
         self.state ^ 0xFFFF_FFFF
     }
 }
@@ -44,7 +36,7 @@ impl Default for Crc32 {
 }
 
 
-///! Не финализирует crc32, просто возвращая self.state!
+/// Не финализирует crc32, просто возвращая self.state!
 impl Into<u32> for Crc32 {
     fn into(self) -> u32 {
         self.state

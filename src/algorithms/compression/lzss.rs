@@ -1,5 +1,5 @@
 use crate::error::AppError;
-use crate::archiver::Artifact;
+use crate::archiver::{ArchivedArtifactEntry, Artifact};
 use crate::algorithms::compression::{CompressionId, Compressor};
 use crate::algorithms::compression::utils::{
     BufferedArtifactReader, DecodeHistory, HashChain, SlidingWindow, find_longest_match,
@@ -198,7 +198,6 @@ impl LzssCompressor {
 
         // Продолжения сжатия с уже отработанного блока
         let mut output = Artifact::new_with_temp_file_suffix(&artifact, "compressed");
-        output.write_chunk_from(&original_size.to_le_bytes())?;
         if !out_buf.is_empty() {
             output.write_chunk_from(&out_buf)?;
             out_buf.clear();
@@ -236,11 +235,11 @@ impl Compressor for LzssCompressor {
         self.compress_impl(artifact, true)
     }
 
-    fn decompress(&self, mut artifact: Artifact) -> Result<Artifact, AppError> {
+    fn decompress(&self, mut artifact: Artifact, entry: &ArchivedArtifactEntry) -> Result<Artifact, AppError> {
         let mut output = Artifact::new_with_temp_file_suffix(&artifact, "decompressed");
 
         let mut reader = BufferedArtifactReader::new(&mut artifact);
-        let original_size = reader.read_u64_le()?;
+        let original_size: u64 = entry.original_size;
 
         // Цикл деархивации
         let mut window = DecodeHistory::new(WINDOW_SIZE);

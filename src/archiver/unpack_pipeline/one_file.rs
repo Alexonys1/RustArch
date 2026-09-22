@@ -1,9 +1,12 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::error::AppError;
 use crate::algorithms::{Cipher, Compressor, ErrorCorrectionCode};
 use crate::archiver::{
-    ArchivedArtifactEntry, Artifact, crc32_of_artifact_and_rewind, resolve_output_path,
+    ArchivedArtifactEntry, Artifact,
+    crc32_of_artifact_and_rewind,
+    validate_empty_artifact_entry,
+    resolve_output_path,
 };
 
 
@@ -17,10 +20,16 @@ pub fn unpack_file(
     decode_key: &[u8],
 ) -> Result<(), AppError>
 {
-    let output_path = resolve_output_path(output_dir, &entry.relative_path)?;
+    let output_path: PathBuf = resolve_output_path(output_dir, &entry.relative_path)?;
 
     if let Some(parent) = output_path.parent() {
         std::fs::create_dir_all(parent)?;
+    }
+
+    if entry.original_size == 0 {
+        validate_empty_artifact_entry(entry)?;
+        std::fs::File::create(&output_path)?;
+        return Ok(());
     }
 
     let windowed_artifact = Artifact::from_file_range(archive_path, entry.payload_offset, entry.stored_size)?;
@@ -31,7 +40,7 @@ pub fn unpack_file(
 
     let (fec_decoded_artifact, _fec_report) = fec.decode(windowed_artifact)?;
     let decrypted_artifact = cipher.transform(fec_decoded_artifact, decode_key)?;
-    let original_artifact = compressor.decompress(decrypted_artifact)?;
+    let original_artifact = compressor.decompress(decrypted_artifact, &entry)?;
 
     original_artifact.save_as_finish_file(&output_path)?;
 

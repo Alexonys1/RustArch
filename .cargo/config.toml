@@ -1,4 +1,4 @@
 [alias]
-prof = "samply record cargo run -- --release --bin RustArch"
+prof = "samply record cargo run -- --release --bin rustarch"
 test-all = "test -- --include-ignored"
 slow-tests = "test -- --ignored"

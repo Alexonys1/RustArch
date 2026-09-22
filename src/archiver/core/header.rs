@@ -1,4 +1,4 @@
-//! Бинарный формат архива RustArch.
+//! Бинарный формат архива rustarch.
 //!
 //! ```text
 //! [payload файлов]
@@ -11,7 +11,7 @@
 //! между двумя таблицами, поэтому отдельный тип записи в них не хранится.
 
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Write, Seek, SeekFrom};
 use std::path::Path;
 
 use crate::algorithms::PipelineSettings;
@@ -19,7 +19,7 @@ use crate::error::AppError;
 
 
 pub const MAGIC: [u8; 4] = *b"RARC";
-pub const FORMAT_VERSION: u16 = 4;
+pub const FORMAT_VERSION: u16 = 3;
 pub const FOOTER_SIZE: u64 = 32;
 
 
@@ -277,9 +277,11 @@ fn ensure_inside_table(file: &mut File, table_end: u64) -> Result<(), AppError> 
 
 
 pub fn validate_payload_ranges(files: &[ArchivedArtifactEntry], payload_end: u64) -> Result<(), AppError> {
-    let mut ranges = Vec::with_capacity(files.len());
+    let mut ranges: Vec<(u64, u64)> = Vec::with_capacity(files.len());
 
     for entry in files {
+        validate_empty_artifact_entry(entry)?;
+
         let end = entry
             .payload_offset
             .checked_add(entry.stored_size)
@@ -317,6 +319,36 @@ pub fn validate_payload_ranges(files: &[ArchivedArtifactEntry], payload_end: u64
         return Err(AppError::CorruptArchive(
             "Конец payload-секции не совпадает с началом таблиц".into(),
         ));
+    }
+
+    Ok(())
+}
+
+
+pub fn validate_empty_artifact_entry(entry: &ArchivedArtifactEntry) -> Result<(), AppError> {
+    if entry.original_size != 0 {
+        return Ok(());
+    }
+
+    if entry.stored_size != 0 {
+        return Err(AppError::CorruptArchive(format!(
+            "Пустой файл '{}' содержит ненулевой payload",
+            entry.relative_path
+        )));
+    }
+
+    if entry.pipeline != PipelineSettings::default() {
+        return Err(AppError::CorruptArchive(format!(
+            "Пустой файл '{}' содержит ненулевой pipeline",
+            entry.relative_path
+        )));
+    }
+
+    if entry.crc32 != u32::MAX {
+        return Err(AppError::CorruptArchive(format!(
+            "Пустой файл '{}' содержит некорректную CRC32-заглушку",
+            entry.relative_path
+        )));
     }
 
     Ok(())

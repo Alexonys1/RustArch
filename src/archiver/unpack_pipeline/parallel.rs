@@ -3,9 +3,9 @@ use std::collections::BinaryHeap;
 use std::path::Path;
 use std::thread;
 
-use super::one_file::unpack_file;
-use crate::archiver::ArchivedArtifactEntry;
 use crate::error::AppError;
+use crate::archiver::ArchivedArtifactEntry;
+use super::one_file::unpack_file;
 
 
 const MAX_PARALLELISM: usize = usize::MAX;
@@ -54,13 +54,10 @@ fn unpack_entry_group(
     Ok(())
 }
 
-fn entry_weight(entry: &ArchivedArtifactEntry) -> u64 {
-    entry.stored_size.max(1)
-}
 
 fn group_entries_for_workers(entries: &[ArchivedArtifactEntry]) -> Vec<Vec<&ArchivedArtifactEntry>> {
     if entries.is_empty() {
-        return Vec::new();
+        return vec![];
     }
 
     let number_of_workers = thread::available_parallelism()
@@ -84,4 +81,9 @@ fn group_entries_for_workers(entries: &[ArchivedArtifactEntry]) -> Vec<Vec<&Arch
     }
 
     groups
+}
+
+
+fn entry_weight(entry: &ArchivedArtifactEntry) -> u64 {
+    entry.stored_size.max(1)
 }

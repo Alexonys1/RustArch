@@ -6,8 +6,6 @@ use crate::algorithms::{CipherId, CompressionId, FecId, PipelineSettings};
 use crate::error::AppError;
 
 
-const MAX_KEY_SIZE: usize = 1024 * 1024;
-
 #[derive(Debug, Clone)]
 pub enum CLICommand {
     Pack {
@@ -28,13 +26,13 @@ pub enum CLICommand {
     Version,
 }
 
-pub const HELP: &str = r#"RustArch - многопоточный архиватор
+pub const HELP: &str = r#"rustarch - многопоточный архиватор
 
 ИСПОЛЬЗОВАНИЕ:
-    RustArch pack <SOURCE> <ARCHIVE> [OPTIONS]
-    RustArch unpack <ARCHIVE> <DESTINATION> [OPTIONS]
-    RustArch list <ARCHIVE>
-    RustArch help
+    rustarch pack <SOURCE> <ARCHIVE> [OPTIONS]
+    rustarch unpack <ARCHIVE> <DESTINATION> [OPTIONS]
+    rustarch list <ARCHIVE>
+    rustarch help
 
 КОМАНДА pack:
     -c, --compression <ALGORITHM>   none | rle | huffman | lzss | deflate
@@ -59,10 +57,10 @@ pub const HELP: &str = r#"RustArch - многопоточный архивато
     --                              Конец опций; нужен для путей, начинающихся с '-'
 
 ПРИМЕРЫ:
-    RustArch pack ./data backup.rarc -c lzss
-    RustArch pack ./data backup.rarc -c deflate --cipher xor --key-hex deadbeef
-    RustArch unpack backup.rarc ./restored --key-hex deadbeef
-    RustArch list backup.rarc
+    rustarch pack ./data backup.rarc -c lzss
+    rustarch pack ./data backup.rarc -c deflate --cipher xor --key-hex deadbeef
+    rustarch unpack backup.rarc ./restored --key-hex deadbeef
+    rustarch list backup.rarc
 "#;
 
 
@@ -70,12 +68,13 @@ pub fn print_help() {
     print!("{HELP}");
 }
 
-pub fn parse_args<I, T>(args: I) -> Result<CLICommand, AppError>
+pub fn parse_args<IntoIter, T>(args: IntoIter) -> Result<CLICommand, AppError>
 where
-    I: IntoIterator<Item = T>,
+    IntoIter: IntoIterator<Item = T>,
     T: Into<OsString>,
 {
     let mut args: Vec<OsString> = args.into_iter().map(Into::into).collect();
+
     if args.is_empty() {
         return Ok(CLICommand::Help);
     }
@@ -87,9 +86,9 @@ where
         Some("list") | Some("ls") | Some("l") => parse_list(args),
         Some("help") | Some("-h") | Some("--help") => Ok(CLICommand::Help),
         Some("version") | Some("-V") | Some("--version") => Ok(CLICommand::Version),
-        Some(other) => Err(usage_error(format!("неизвестная команда '{other}'"))),
+        Some(other) => Err(usage_error(format!("Неизвестная команда '{other}'"))),
         None => Err(usage_error(
-            "имя команды не является валидной UTF-8 строкой",
+            "Имя команды не является валидной UTF-8 строкой",
         )),
     }
 }
@@ -383,12 +382,7 @@ fn load_key(source: Option<KeySource>) -> Result<Vec<u8>, AppError> {
         }),
     }?;
 
-    if bytes.len() > MAX_KEY_SIZE {
-        return Err(usage_error(format!(
-            "ключ слишком большой: {} байт; максимум {MAX_KEY_SIZE}",
-            bytes.len()
-        )));
-    }
+
     Ok(bytes)
 }
 

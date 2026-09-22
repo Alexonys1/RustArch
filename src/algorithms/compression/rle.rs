@@ -1,5 +1,5 @@
 use crate::error::AppError;
-use crate::archiver::Artifact;
+use crate::archiver::{ArchivedArtifactEntry, Artifact};
 use super::{CompressionId, Compressor};
 
 
@@ -51,7 +51,7 @@ impl Compressor for RleCompressor {
         Ok((output, CompressionId::RLE))
     }
 
-    fn decompress(&self, mut artifact: Artifact) -> Result<Artifact, AppError> {
+    fn decompress(&self, mut artifact: Artifact, _: &ArchivedArtifactEntry) -> Result<Artifact, AppError> {
         let mut output = Artifact::new_with_temp_file_suffix(&artifact, "decompressed");
         let mut pending_count: Option<u8> = None;
         let mut out_buf: Vec<u8> = Vec::with_capacity(8192);

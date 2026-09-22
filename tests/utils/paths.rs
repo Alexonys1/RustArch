@@ -47,7 +47,7 @@ pub fn get_temp_dir_path() -> PathBuf {
         let home = env::var("USERPROFILE").unwrap();
         PathBuf::from(home)
             .join("RustroverProjects")
-            .join("RustArch")
+            .join("rustarch")
             .join("test_data_for_removing")
     }).clone()
 }

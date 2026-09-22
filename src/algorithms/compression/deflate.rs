@@ -1,4 +1,4 @@
-use crate::archiver::Artifact;
+use crate::archiver::{ArchivedArtifactEntry, Artifact};
 use crate::error::AppError;
 use super::{CompressionId, Compressor};
 use super::{HuffmanCompressor, LzssCompressor};
@@ -23,9 +23,13 @@ impl Compressor for DeflateCompressor {
         Ok((huffman_stage, result_compression_id))
     }
 
-    fn decompress(&self, artifact: Artifact) -> Result<Artifact, AppError> {
-        let huffman_stage = HuffmanCompressor.decompress(artifact)?;
-        let lzss_stage = LzssCompressor.decompress(huffman_stage)?;
+    fn decompress(&self, artifact: Artifact, entry: &ArchivedArtifactEntry) -> Result<Artifact, AppError> {
+        // Huffman восстанавливает размер промежуточного LZSS-потока по сумме
+        // частот, а LZSS берет конечный размер файла из entry.
+
+        let huffman_stage = HuffmanCompressor.decompress(artifact, entry)?;
+        let lzss_stage = LzssCompressor.decompress(huffman_stage, entry)?;
+
         Ok(lzss_stage)
     }
 

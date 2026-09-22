@@ -2,7 +2,7 @@ use std::fs::File;
 use std::path::Path;
 use std::io::{BufReader, Read};
 
-use RustArch::archiver::{walk_directory_or_file, Crc32, DEFAULT_CHUNK_SIZE_IN_BYTES};
+use rustarch::archiver::{walk_directory_or_file, Crc32, DEFAULT_CHUNK_SIZE_IN_BYTES};
 
 
 /// Пустые папки не учитываются. TODO: Потом как-нибудь допишу.

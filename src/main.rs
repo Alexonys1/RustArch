@@ -1,9 +1,9 @@
 use std::path::Path;
 use std::time::Instant;
 
-use RustArch::algorithms::{CipherId, CompressionId, FecId, PipelineSettings};
-use RustArch::cli::{CLICommand, parse_args, run_command};
-use RustArch::error::AppError;
+use rustarch::algorithms::{CipherId, CompressionId, FecId, PipelineSettings};
+use rustarch::cli::{CLICommand, parse_args, run_command};
+use rustarch::error::AppError;
 
 
 #[allow(dead_code)]
@@ -16,14 +16,14 @@ enum QuickRunMode {
 }
 
 const QUICK_SETTINGS: PipelineSettings = PipelineSettings {
-    compression: CompressionId::Huffman, // <========================================
+    compression: CompressionId::Deflate, // <========================================
     cipher: CipherId::NoCipher, // <========================================
     fec: FecId::NoFec, // <========================================
 };
 
 
-const QUICK_RUN_MODE: QuickRunMode = QuickRunMode::Release; // <==============================
-const QUICK_SOURCE_PATH: &str = r"C:\Games\Battlefield 2142 Novgames RST";
+const QUICK_RUN_MODE: QuickRunMode = QuickRunMode::Pack; // <==============================
+const QUICK_SOURCE_PATH: &str = r"C:\Users\alex\Desktop\Тестовые данные для архиватора\Низкая энтропия\Текст";
 const QUICK_ARCHIVE_PATH: &str = r".\test_data_for_removing\study.arch";
 const QUICK_UNPACK_PATH: &str = r".\test_data_for_removing\unpacked";
 const QUICK_WORKERS_FOR_GROUPING: usize = 16;
@@ -31,9 +31,18 @@ const QUICK_WORKERS_FOR_GROUPING: usize = 16;
 
 fn main() {
     let cli_command: CLICommand = match QUICK_RUN_MODE {
-        QuickRunMode::Pack => quick_pack_command(),
+        QuickRunMode::Pack => CLICommand::Pack {
+            source_path: QUICK_SOURCE_PATH.into(),
+            target_archive_path: QUICK_ARCHIVE_PATH.into(),
+            settings: QUICK_SETTINGS,
+            encode_key: (1..=255).collect(),
+        },
 
-        QuickRunMode::Unpack => quick_unpack_command(),
+        QuickRunMode::Unpack => CLICommand::Unpack {
+            source_path: QUICK_ARCHIVE_PATH.into(),
+            target_unpack_path: QUICK_UNPACK_PATH.into(),
+            decode_key: (1..=255).collect(),
+        },
 
         QuickRunMode::TestGrouping => {
             if let Err(error) = run_quick_grouping() {
@@ -47,7 +56,7 @@ fn main() {
             Ok(command) => command,
             Err(error) => {
                 eprintln!("Ошибка: {error}");
-                eprintln!("Используйте 'RustArch --help' для справки.");
+                eprintln!("Используйте 'rustarch --help' для справки.");
                 std::process::exit(2);
             }
         }
@@ -68,7 +77,7 @@ fn main() {
         CLICommand::Pack { target_archive_path, .. } => {
             match std::fs::metadata(&target_archive_path) {
                 Ok(metadata) => println!(
-                    "===> TOTAL SIZE: {:.2} GiB ({} bytes)",
+                    "===> TOTAL SIZE: {:.2} GB ({} bytes)",
                     metadata.len() as f64 / 1024_f64.powi(3),
                     metadata.len(),
                 ),
@@ -87,25 +96,8 @@ fn main() {
 
 // ===================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ БЫСТРОГО ТЕСТИРОВАНИЯ =========================
 // Очень лень писать скрипты с разными командами для архиватора...
-fn quick_pack_command() -> CLICommand {
-    CLICommand::Pack {
-        source_path: QUICK_SOURCE_PATH.into(),
-        target_archive_path: QUICK_ARCHIVE_PATH.into(),
-        settings: QUICK_SETTINGS,
-        encode_key: (1..=255).collect(),
-    }
-}
-
-fn quick_unpack_command() -> CLICommand {
-    CLICommand::Unpack {
-        source_path: QUICK_ARCHIVE_PATH.into(),
-        target_unpack_path: QUICK_UNPACK_PATH.into(),
-        decode_key: (1..=255).collect(),
-    }
-}
-
 fn run_quick_grouping() -> Result<(), AppError> {
-    use RustArch::archiver::{WalkedFile, group_files_for_workers, walk_directory_or_file};
+    use rustarch::archiver::{WalkedFile, group_files_for_workers, walk_directory_or_file};
 
     let started = Instant::now();
     let walked_files: Vec<WalkedFile> = walk_directory_or_file(Path::new(QUICK_SOURCE_PATH))?.files;

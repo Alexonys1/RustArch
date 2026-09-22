@@ -2,30 +2,14 @@ use std::io;
 
 use crate::error::AppError;
 use crate::archiver::Artifact;
-use crate::archiver::memory_budget::BudgetGuard; // поправьте путь под свою иерархию
+use crate::archiver::memory_budget::BudgetGuard;
 
-// ---------------------------------------------------------------------
-// SlidingWindow - ограниченный по памяти буфер входных данных
-// ---------------------------------------------------------------------
 
-/// Читаем вход сравнительно крупными блоками, но не позволяем размеру
-/// `Artifact::chunk_size` (по умолчанию 512 КиБ) раздувать окно.
-const INPUT_READ_SIZE: usize = 64 * 1024;
+/// Размер блока чтения
+const INPUT_READ_SIZE: usize = 256 * 1024;
 
-/// Держит в памяти ТОЛЬКО то, что реально может понадобиться алгоритму:
-/// до `window_size` байт уже пройденной "истории" позади текущей позиции
-/// и какое-то количество байт упреждающего просмотра впереди. Размер
-/// буфера НЕ зависит от размера обрабатываемого файла - в этом всё дело:
-/// раньше LZSS читал файл целиком в `Vec<u8>`, из-за чего 2.7 ГБ файл
-/// занимал 2.7 ГБ оперативной памяти только под входные данные.
-/// Держит в памяти ТОЛЬКО то, что реально может понадобиться алгоритму:
-/// до `window_size` байт уже пройденной "истории" позади текущей позиции
-/// и какое-то количество байт упреждающего просмотра впереди. Размер
-/// буфера НЕ зависит от размера обрабатываемого файла.
-///
-/// Хранилище - непрерывный `Vec<u8>` (не `VecDeque`). Оно компактируется
-/// через `copy_within` только перед refill, поэтому `slice_from()` всегда
-/// возвращает настоящий срез `&[u8]` для 8-байтового сравнения.
+
+/// Оптимизация LZSS, удерживает в памяти последние 32 КиБ информации
 pub struct SlidingWindow {
     buffer: Vec<u8>,
     /// Абсолютная позиция в потоке, которой соответствует buffer[0].
@@ -42,12 +26,12 @@ impl SlidingWindow {
             .checked_add(INPUT_READ_SIZE)
             .and_then(|v| v.checked_add(lookahead_size))
             .ok_or_else(|| AppError::Compression(
-                "LZ: переполнение при вычислении размера скользящего окна".into(),
+                "LZSS: Переполнение при вычислении размера скользящего окна".into(),
             ))?;
         let mut guard = BudgetGuard::default();
         if !guard.try_grow(capacity as i64) {
             return Err(AppError::Compression(format!(
-                "LZSS: не удалось зарезервировать {capacity} байт под скользящее окно - бюджет памяти исчерпан"
+                "LZSS: Не удалось зарезервировать {capacity} байт под скользящее окно - бюджет памяти исчерпан"
             )));
         }
         Ok(Self {
@@ -60,6 +44,7 @@ impl SlidingWindow {
         })
     }
 
+    /// Выделение памяти и чтение блока файла
     pub fn ensure_available(&mut self, artifact: &mut Artifact, pos: u64, want: usize) -> io::Result<()> {
         if self.available_after(pos) < want && !self.exhausted {
             self.compact_for(pos);
@@ -70,7 +55,7 @@ impl SlidingWindow {
             if free == 0 {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "LZ: недостаточная ёмкость скользящего окна",
+                    "LZ: Недостаточная ёмкость скользящего окна!",
                 ));
             }
 
@@ -86,6 +71,7 @@ impl SlidingWindow {
         Ok(())
     }
 
+    /// Сброс отработанной части файла
     fn compact_for(&mut self, pos: u64) {
         let keep_from = pos.saturating_sub(self.window_size as u64);
         if keep_from <= self.base_pos {
@@ -98,6 +84,7 @@ impl SlidingWindow {
         self.base_pos = keep_from;
     }
 
+    /// Чтение необработанной части файла после сброса
     pub fn available_after(&self, pos: u64) -> usize {
         let local = (pos - self.base_pos) as usize;
         self.buffer.len().saturating_sub(local)
@@ -107,17 +94,13 @@ impl SlidingWindow {
         self.buffer[(pos - self.base_pos) as usize]
     }
 
-    /// Непрерывный срез от позиции `pos` до конца буферизованных данных -
-    /// именно он и делает возможным быстрое блочное сравнение совпадений
-    /// в `common_prefix_len` вместо побайтового цикла.
+    /// Непрерывный срез от позиции `pos` до конца буферизованных данных
     pub fn slice_from(&self, pos: u64) -> &[u8] {
         let local = (pos - self.base_pos) as usize;
         &self.buffer[local..]
     }
 
     pub fn trim_if_needed(&mut self, pos: u64) {
-        // Не двигаем память на горячем пути каждого токена. История
-        // компактируется один раз непосредственно перед refill.
         debug_assert!(pos >= self.base_pos);
     }
 }
@@ -126,28 +109,17 @@ impl SlidingWindow {
 // HashChain - поиск совпадений без HashMap/SipHash
 // ---------------------------------------------------------------------
 
-/// Размер таблицы голов хэш-цепочек. Фиксированная константа - в отличие
-/// от `HashMap<[u8;3], Vec<usize>>`, эта структура не растёт вместе с
-/// количеством уникальных 3-байтовых префиксов в файле.
+/// Размер таблицы голов хэш-цепочек.
 const HASH_BITS: u32 = 16;
 const HASH_SIZE: usize = 1 << HASH_BITS;
 
-/// Значение-метка "цепочка закончилась" (u64::MAX никогда не встретится
-/// как реальная позиция в файле).
+/// Значение-метка "цепочка закончилась"
 const NONE: u64 = u64::MAX;
 
-/// Классическая схема хэш-цепочек (как в zlib): `head[hash]` - самая
-/// свежая позиция с данным хэшем, `prev[pos % window_size]` - позиция
-/// предыдущего вхождения ТОГО ЖЕ хэша, что и в позиции `pos`. Обе таблицы
-/// фиксированного размера (`HASH_SIZE` + `window_size`), поэтому память
-/// ограничена константой независимо от размера входного файла - в отличие
-/// от `HashMap<[u8;3], Vec<usize>>`, где на файле с частыми повторами
-/// количество и суммарная длина бакетов росли неограниченно.
-///
-/// Дополнительный выигрыш: обычный `HashMap` в Rust использует SipHash -
-/// специально медленный (криптостойкий) хэшер. Здесь используется простое
-/// мультипликативное хэширование трёх байт, на порядки быстрее на горячем
-/// пути, вызываемом на каждую позицию файла.
+/// Классическая схема хэш-цепочек
+/// head[hash] - самая свежая позиция с данным хэшем
+/// prev[pos % window_size] - позиция предыдущего вхождения ТОГО ЖЕ хэша, что и в позиции pos
+
 pub struct HashChain {
     head: Vec<u64>,
     prev: Vec<u64>,
@@ -174,13 +146,10 @@ impl HashChain {
 
     fn hash3(b0: u8, b1: u8, b2: u8) -> usize {
         let v = (b0 as u32) | ((b1 as u32) << 8) | ((b2 as u32) << 16);
-        // Мультипликативное хэширование (Кнут) - быстро, без коллизий-ловушек
-        // для обычных данных, и не требует криптостойкости SipHash.
         ((v.wrapping_mul(2_654_435_761)) >> (32 - HASH_BITS)) as usize
     }
 
-    /// Индексирует позицию `pos` по её 3-байтовому префиксу. Вызывающий
-    /// код обязан убедиться, что байты `pos..pos+3` доступны в окне.
+    /// Индексирует позицию `pos` по её 3-байтовому префиксу.
     pub fn insert(&mut self, window: &SlidingWindow, pos: u64) {
         if window.available_after(pos) < 3 {
             return;
@@ -192,8 +161,7 @@ impl HashChain {
         self.head[h] = pos;
     }
 
-    /// Итератор по цепочке кандидатов для позиции `pos`, от самого свежего
-    /// к самому старому, останавливающийся на границе окна `window_start`.
+    /// Итератор по цепочке кандидатов для позиции `pos`, от самого свежего к самому старому.
     fn candidates(&self, window: &SlidingWindow, pos: u64, window_start: u64) -> impl Iterator<Item = u64> + '_ {
         let (b0, b1, b2) = (window.byte_at(pos), window.byte_at(pos + 1), window.byte_at(pos + 2));
         let h = Self::hash3(b0, b1, b2);
@@ -211,13 +179,7 @@ impl HashChain {
     }
 }
 
-/// Сравнивает две последовательности байт и возвращает длину общего
-/// префикса (не больше `max_len`). Сравнивает по 8 байт за раз через XOR
-/// вместо побайтового цикла - на длинных совпадениях (частых в
-/// структурированных бинарных данных: повторяющиеся блоки, выровненные
-/// нулевые области) это даёт на порядок меньше итераций, чем цикл
-/// "сравнили байт - сдвинулись на один". Тот же приём используется в
-/// zlib-ng/lz4 для ускорения именно этого горячего пути.
+/// Сравнивает две последовательности байт и возвращает длину общего префикса (не больше `max_len`).
 fn common_prefix_len(a: &[u8], b: &[u8], max_len: usize) -> usize {
     let limit = max_len.min(a.len()).min(b.len());
     let mut len = 0;
@@ -227,8 +189,6 @@ fn common_prefix_len(a: &[u8], b: &[u8], max_len: usize) -> usize {
         let wb = u64::from_le_bytes(b[len..len + 8].try_into().unwrap());
         let diff = wa ^ wb;
         if diff != 0 {
-            // Благодаря from_le_bytes trailing_zeros/8 - номер первого
-            // несовпадающего байта на любой endian-архитектуре.
             return len + (diff.trailing_zeros() / 8) as usize;
         }
         len += 8;
@@ -241,17 +201,11 @@ fn common_prefix_len(a: &[u8], b: &[u8], max_len: usize) -> usize {
     len
 }
 
-/// Если найдено совпадение такой длины или больше - прекращаем перебор
-/// цепочки кандидатов немедленно (аналог `nice_match` в zlib). Более
-/// длинное совпадение технически возможно, но искать его среди оставшихся
-/// кандидатов почти никогда не окупается: выигрыш в сжатии исчезающе мал
-/// по сравнению со стоимостью полного прохода по цепочке.
 const NICE_MATCH_LEN: usize = 128;
 const GOOD_MATCH_LEN: usize = 32;
 
-/// Ищет самое длинное совпадение для данных, начинающихся в `pos`.
-/// Возвращает (offset, length); (0, 0), если совпадения длиной
-/// >= `min_match_len` не нашлось.
+/// Ищет самое длинное совпадение для данных, начинающихся в pos
+/// Возвращает (offset, length); (0, 0), если совпадения длиной >= min_match_len не нашлось.
 pub fn find_longest_match(
     window: &SlidingWindow,
     chain: &HashChain,
@@ -271,9 +225,6 @@ pub fn find_longest_match(
     let mut best_len = 0usize;
     let mut best_offset = 0usize;
 
-    // Самый частый случай на низкоэнтропийных данных - серия одного
-    // байта. Для offset=1 длинное совпадение можно принять без обхода
-    // хэш-цепочки.
     if pos > window_start && window.byte_at(pos - 1) == current[0] {
         let len = common_prefix_len(window.slice_from(pos - 1), current, max_len);
         if len >= min_match_len {
@@ -290,8 +241,7 @@ pub fn find_longest_match(
             break;
         }
 
-        // Аналог good_match из zlib: после хорошего совпадения оставляем
-        // только четверть исходного бюджета цепочки.
+        // После хорошего совпадения оставляем только четверть исходного бюджета цепочки.
         if best_len >= GOOD_MATCH_LEN && checked >= max_chain_len.div_ceil(4) {
             break;
         }
@@ -329,10 +279,7 @@ pub fn find_longest_match(
 }
 
 // ---------------------------------------------------------------------
-// BufferedArtifactReader - читает токены декомпрессии пачками, а не по
-// 1-2 байта напрямую из Artifact (который на File-состоянии делает
-// seek()+read() НА КАЖДЫЙ такой вызов - это и был отдельный источник
-// торможения, не связанный с памятью).
+// BufferedArtifactReader - читает токены декомпрессии пачками, а не по 1-2 байта напрямую из Artifact
 // ---------------------------------------------------------------------
 
 pub struct BufferedArtifactReader<'a> {
@@ -390,13 +337,6 @@ impl<'a> BufferedArtifactReader<'a> {
         Ok(value)
     }
 
-    pub fn read_u64_le(&mut self) -> Result<u64, AppError> {
-        self.fill(8)?;
-        let value = u64::from_le_bytes(self.buf[self.pos..self.pos + 8].try_into().unwrap());
-        self.pos += 8;
-        Ok(value)
-    }
-
     /// Добавляет ровно `n` байт в существующий выходной буфер без
     /// промежуточного Vec и без аллокации на каждый литеральный блок.
     pub fn append_exact(&mut self, mut n: usize, out: &mut Vec<u8>) -> Result<(), AppError> {
@@ -415,8 +355,7 @@ impl<'a> BufferedArtifactReader<'a> {
 }
 
 
-/// Фиксированное кольцевое окно декодера. В отличие от VecDeque не
-/// выполняет pop_front для каждого байта.
+/// Фиксированное кольцевое окно декодера.
 pub struct DecodeHistory {
     data: Vec<u8>,
     write: usize,
@@ -469,13 +408,4 @@ impl DecodeHistory {
         }
         Ok(())
     }
-}
-
-
-pub fn flush_if_needed(out_buf: &mut Vec<u8>, output: &mut Artifact, output_flush_size: usize) -> Result<(), AppError> {
-    if out_buf.len() >= output_flush_size {
-        output.write_chunk_from(out_buf)?;
-        out_buf.clear();
-    }
-    Ok(())
 }

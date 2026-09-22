@@ -35,7 +35,7 @@ pub fn run_command(command: CLICommand) -> Result<(), AppError> {
         }
 
         CLICommand::Version => {
-            println!("RustArch {}", env!("CARGO_PKG_VERSION"));
+            println!("rustarch {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
     }

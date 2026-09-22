@@ -10,7 +10,7 @@ pub use lzss::LzssCompressor;
 pub use rle::RleCompressor;
 
 use super::ids::CompressionId;
-use crate::archiver::Artifact;
+use crate::archiver::{ArchivedArtifactEntry, Artifact};
 use crate::error::AppError;
 
 
@@ -21,7 +21,7 @@ pub trait Compressor {
 
     /// Читает `artifact` от текущей позиции чтения до конца, отдаёт
     /// новый артефакт со разжатыми данными.
-    fn decompress(&self, artifact: Artifact) -> Result<Artifact, AppError>;
+    fn decompress(&self, artifact: Artifact, entry: &ArchivedArtifactEntry) -> Result<Artifact, AppError>;
     fn id(&self) -> CompressionId;
 }
 
@@ -34,7 +34,7 @@ impl Compressor for NoneCompressor {
         Ok((artifact, CompressionId::NoCompression))
     }
 
-    fn decompress(&self, artifact: Artifact) -> Result<Artifact, AppError> {
+    fn decompress(&self, artifact: Artifact, _: &ArchivedArtifactEntry) -> Result<Artifact, AppError> {
         Ok(artifact)
     }
 

@@ -1,5 +1,5 @@
 use crate::error::AppError;
-use crate::archiver::Artifact;
+use crate::archiver::{ArchivedArtifactEntry, Artifact};
 use crate::algorithms::compression::{CompressionId, Compressor};
 use crate::algorithms::compression::huffman::bit_handlers::{BitWindow, StreamingBitWriter};
 use crate::algorithms::compression::huffman::decode_table::{build_decode_table, DecodeEntry};
@@ -29,23 +29,22 @@ impl Compressor for HuffmanCompressor {
         self.compress_impl(artifact, true) // Роберт Мартин был бы в бешенстве от передачи флагов в функции xD
     }
 
-    fn decompress(&self, mut artifact: Artifact) -> Result<Artifact, AppError> {
+    fn decompress(&self, mut artifact: Artifact, _: &ArchivedArtifactEntry) -> Result<Artifact, AppError> {
         // ============================ ЧИТАЕМ ЗАГОЛОВОК ФАЙЛА ==========================
         let mut output = Artifact::new_with_temp_file_suffix(&artifact, "decompressed");
 
-        let original_size: u64 = artifact.read_le_u64()?;
-        let distinct_count: usize = artifact.read_le_u16()? as usize;
-        if distinct_count > ALPHABET_SIZE {
+        let nonzero_freqs_count: usize = artifact.read_le_u16()? as usize;
+        if nonzero_freqs_count > ALPHABET_SIZE {
             return Err(AppError::CorruptArchive(
                 "Huffman: Число символов превышает размер алфавита!".into(),
             ));
         }
 
-        let mut nonzero_freqs: Vec<SymbolWithFreq> = Vec::with_capacity(distinct_count);
+        let mut nonzero_freqs: Vec<SymbolWithFreq> = Vec::with_capacity(nonzero_freqs_count);
         let mut seen = [false; ALPHABET_SIZE];
-        let mut frequency_sum = 0u64;
+        let mut frequency_sum: u64 = 0;
 
-        for _ in 0..distinct_count {
+        for _ in 0..nonzero_freqs_count {
             let symbol: u8 = artifact.read_le_u8()?;
             let freq: u64 = artifact.read_le_u64()?;
 
@@ -62,19 +61,11 @@ impl Compressor for HuffmanCompressor {
             nonzero_freqs.push(SymbolWithFreq { symbol, freq });
         }
 
-        if frequency_sum != original_size {
-            return Err(AppError::CorruptArchive(
-                "Huffman: Сумма частот не совпадает с original_size".into(),
-            ));
-        }
+        let original_size: u64 = frequency_sum;
 
         if original_size == 0 {
-            return Ok(output);
-        }
-
-        if nonzero_freqs.is_empty() {
             return Err(AppError::CorruptArchive(
-                "Huffman: Пустая частотная таблица при ненулевом original_size!".into(),
+                "Huffman: пустой поток должен храниться без сжатия".into(),
             ));
         }
 
@@ -159,6 +150,7 @@ impl Compressor for HuffmanCompressor {
 
 
 impl HuffmanCompressor {
+    /// Остаток старого кода. Если нужно будет, то применим снова.
     pub fn compress_always(&self, artifact: Artifact) -> Result<Artifact, AppError> {
         Ok(self.compress_impl(artifact, false)?.0)
     }
@@ -182,17 +174,20 @@ impl HuffmanCompressor {
             .map(|(symbol, f)| SymbolWithFreq { symbol: symbol as u8, freq: f })
             .collect();
 
-        // Раньше без проверок на пустой файл архиватор просто ложился :D
-        if original_size == 0 || nonzero_freqs.len() <= 1 {
+        if original_size == 0 {
+            return Ok((artifact, CompressionId::NoCompression));
+        }
+
+        if nonzero_freqs.len() == 1 {
             let mut output = Artifact::new_with_temp_file_suffix(&artifact, "compressed");
-            write_header(&mut output, original_size, &nonzero_freqs)?;
+            write_header(&mut output, &nonzero_freqs)?;
             return Ok((output, CompressionId::Huffman));
         }
 
         let tree: NodeOfHuffmanTree = build_tree(&nonzero_freqs);
         let codes: [HuffmanCode; ALPHABET_SIZE] = create_huffman_codes(tree);
 
-        let header_bytes = 8u128 + 2 + nonzero_freqs.len() as u128 * 9;
+        let header_bytes = 2u128 + nonzero_freqs.len() as u128 * 9;
         let encoded_bits: u128 = nonzero_freqs
             .iter()
             .map(|entry| codes[entry.symbol as usize].len as u128 * entry.freq as u128)
@@ -204,7 +199,7 @@ impl HuffmanCompressor {
         }
 
         let mut output_artifact = Artifact::new_with_temp_file_suffix(&artifact, "compressed");
-        write_header(&mut output_artifact, original_size, &nonzero_freqs)?;
+        write_header(&mut output_artifact, &nonzero_freqs)?;
 
         let mut writer = StreamingBitWriter::new(&mut output_artifact);
         while let Some(chunk) = artifact.next_chunk()? {
@@ -220,8 +215,7 @@ impl HuffmanCompressor {
 }
 
 
-fn write_header(output: &mut Artifact, original_size: u64, nonzero_freqs: &[SymbolWithFreq]) -> Result<(), AppError> {
-    output.write_chunk_from(&original_size.to_le_bytes())?;
+fn write_header(output: &mut Artifact, nonzero_freqs: &[SymbolWithFreq]) -> Result<(), AppError> {
     output.write_chunk_from(&(nonzero_freqs.len() as u16).to_le_bytes())?;
 
     for &SymbolWithFreq { symbol, freq } in nonzero_freqs {

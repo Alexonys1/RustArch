@@ -1,7 +1,7 @@
 use std::sync::mpsc::Sender;
 
 use crate::algorithms::{Cipher, Compressor, ErrorCorrectionCode, PipelineSettings};
-use crate::archiver::{ArchivedArtifactEntry, Artifact, WalkedFile, crc32_of_artifact_and_rewind};
+use crate::archiver::{crc32_of_artifact_and_rewind, ArchivedArtifactEntry, Artifact, Crc32, WalkedFile};
 use crate::error::AppError;
 
 
@@ -20,6 +20,24 @@ pub fn pack_file(
     let mut artifact = Artifact::from_file(file.absolute_path.as_ref())?;
 
     let original_size: u64 = artifact.get_payload_size() as u64;
+
+    if original_size == 0 {
+        let entry = ArchivedArtifactEntry {
+            relative_path: file.relative_path.clone(),
+            original_size,
+            stored_size: 0,
+            payload_offset: 0,
+            pipeline: PipelineSettings::default(),
+            crc32: Crc32::default().into(),
+        };
+
+        artifact_sender
+            .send((entry, artifact))
+            .map_err(|_| AppError::Compression("Очередь записи архива недоступна!".into()))?;
+
+        return Ok(());
+    }
+
     let crc32: u32 = crc32_of_artifact_and_rewind(&mut artifact, pipeline_settings)?;
 
     let compressor: Box<dyn Compressor> = pipeline_settings.compression.get();
@@ -46,7 +64,7 @@ pub fn pack_file(
 
     artifact_sender
         .send((entry, cooked_artifact))
-        .map_err(|_| AppError::Compression("Очередь записи архива недоступна".into()))?;
+        .map_err(|_| AppError::Compression("Очередь записи архива недоступна!".into()))?;
 
     Ok(())
 }
