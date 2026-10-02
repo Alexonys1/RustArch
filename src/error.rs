@@ -1,73 +1,190 @@
+use std::error::Error;
 use std::fmt;
 use std::io;
+use std::path::PathBuf;
+
+use crate::algorithms::compression::{HuffmanError, LzssError};
+use crate::algorithms::crypto::XorError;
+use crate::algorithms::fec::ReedSolomonError;
+use crate::archiver::{ArchiveError, InputError, PipelineError};
+use crate::cli::CliError;
 
 
-// Здесь я бы мог использовать библиотеку thiserror с макросами для
-// автоматической реализации преобразования одного типа ошибок в другие.
-// Но, во-первых, я уже всё написал.
-// И, во-вторых, сторонняя библиотека немного замедляет компиляцию.
-
-
-/// Единый тип ошибки на всё приложение. Все подсистемы (сжатие, крипто, FEC,
-/// формат архива, CLI) заворачивают свои ошибки сюда через `From`, поэтому
-/// в коде пайплайна можно свободно использовать `?` независимо от того,
-/// в каком модуле реализована конкретная функция.
 #[derive(Debug)]
-pub enum AppError {
-    /// Ошибка чтения/записи файла (диск, права, нехватка места и т.п.)
-    Io(io::Error),
-
-    /// Файл архива повреждён или имеет несовместимый формат
-    /// (неверная сигнатура, битые метаданные, обрыв на середине таблицы).
-    CorruptArchive(String),
-
-    /// Ошибка конкретного алгоритма сжатия/декомпрессии.
-    Compression(String),
-
-    /// Ошибка шифрования/расшифровки (например, некорректный ключ).
-    Crypto(String),
-
-    /// Ошибка помехоустойчивого кодирования/декодирования.
-    Fec(String),
-
-    /// CRC32 распакованных данных не совпал с сохранённым в архиве -
-    /// сигнал о повреждении данных или неверном ключе шифрования.
-    ChecksumMismatch { path: String },
-
-    /// Алгоритм выбран, но его реализация ещё не написана (Huffman, LZ77,
-    /// Hamming - задел под вашу часть работы). Это НЕ баг, а явная заглушка.
-    NotImplemented(&'static str),
-
-    /// Ошибка использования CLI (неверные аргументы и т.п.)
-    CLIUsage(String),
+pub struct AppError {
+    kind: AppErrorKind,
 }
 
 
-impl fmt::Display for AppError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            AppError::Io(e) => write!(f, "Ошибка ввода-вывода: {e}"),
-            AppError::CorruptArchive(msg) => write!(f, "Архив повреждён: {msg}"),
-            AppError::Compression(msg) => write!(f, "Ошибка сжатия: {msg}"),
-            AppError::Crypto(msg) => write!(f, "Ошибка шифрования: {msg}"),
-            AppError::Fec(msg) => write!(f, "Ошибка помехоустойчивого кодирования: {msg}"),
-            AppError::ChecksumMismatch { path } => {
-                write!(f, "Контрольная сумма не совпала для '{path}': файл повреждён или неверный ключ")
-            }
-            AppError::NotImplemented(name) => {
-                write!(f, "Алгоритм '{name}' ещё не реализован - это заготовка под вашу реализацию")
-            }
-            AppError::CLIUsage(msg) => write!(f, "Ошибка использования: {msg}"),
-        }
+#[derive(Debug, thiserror::Error)]
+pub enum AppErrorKind {
+    #[error("Ошибка ввода-вывода: {0}")]
+    Io(#[source] io::Error),
+
+    #[error("Ошибка формата архива: {0}")]
+    Archive(#[source] ArchiveError),
+
+    #[error("Ошибка использования: {0}")]
+    Cli(#[source] CliError),
+
+    #[error("Ошибка входных данных: {0}")]
+    Input(#[source] InputError),
+
+    #[error("Ошибка конвейера: {0}")]
+    Pipeline(#[source] PipelineError),
+
+    #[error("Ошибка Хаффмана: {0}")]
+    Huffman(#[source] HuffmanError),
+
+    #[error("Ошибка LZSS: {0}")]
+    Lzss(#[source] LzssError),
+
+    #[error("Ошибка XOR: {0}")]
+    Xor(#[source] XorError),
+
+    #[error("Ошибка Reed-Solomon: {0}")]
+    ReedSolomon(#[source] ReedSolomonError),
+
+    #[error(
+        "Контрольная сумма не совпала для '{}': \
+         файл повреждён или неверный ключ", path.display()
+    )]
+    ChecksumMismatch { path: PathBuf },
+
+    #[error("Алгоритм '{0}' ещё не реализован")]
+    NotImplemented(&'static str),
+}
+
+
+impl AppError {
+    #[track_caller]
+    #[cold]
+    #[inline(never)]
+    pub fn new(kind: AppErrorKind) -> AppError {
+        AppError { kind }
+    }
+
+    pub fn kind(&self) -> &AppErrorKind {
+        &self.kind
+    }
+
+    #[track_caller]
+    #[cold]
+    #[inline(never)]
+    pub fn checksum_mismatch(path: impl Into<PathBuf>) -> Self {
+        Self::new(AppErrorKind::ChecksumMismatch { path: path.into() })
+    }
+
+    #[track_caller]
+    #[cold]
+    #[inline(never)]
+    pub fn not_implemented(name: &'static str) -> Self {
+        Self::new(AppErrorKind::NotImplemented(name))
     }
 }
 
+impl fmt::Display for AppError {
+    #[cold]
+    #[inline(never)]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.kind.fmt(f)
+    }
+}
 
-impl std::error::Error for AppError {}
+impl Error for AppError {
+    #[cold]
+    #[inline(never)]
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        self.kind.source()
+    }
+}
 
+impl From<AppErrorKind> for AppError {
+    #[track_caller]
+    #[cold]
+    #[inline(never)]
+    fn from(kind: AppErrorKind) -> Self {
+        Self::new(kind)
+    }
+}
 
 impl From<io::Error> for AppError {
-    fn from(e: io::Error) -> Self {
-        AppError::Io(e)
+    #[track_caller]
+    #[cold]
+    #[inline(never)]
+    fn from(source: io::Error) -> Self {
+        Self::new(AppErrorKind::Io(source))
+    }
+}
+
+impl From<HuffmanError> for AppError {
+    #[track_caller]
+    #[cold]
+    #[inline(never)]
+    fn from(source: HuffmanError) -> Self {
+        Self::new(AppErrorKind::Huffman(source))
+    }
+}
+
+impl From<LzssError> for AppError {
+    #[track_caller]
+    #[cold]
+    #[inline(never)]
+    fn from(source: LzssError) -> Self {
+        Self::new(AppErrorKind::Lzss(source))
+    }
+}
+
+impl From<XorError> for AppError {
+    #[track_caller]
+    #[cold]
+    #[inline(never)]
+    fn from(source: XorError) -> Self {
+        Self::new(AppErrorKind::Xor(source))
+    }
+}
+
+impl From<ReedSolomonError> for AppError {
+    #[track_caller]
+    #[cold]
+    #[inline(never)]
+    fn from(source: ReedSolomonError) -> Self {
+        Self::new(AppErrorKind::ReedSolomon(source))
+    }
+}
+
+impl From<CliError> for AppError {
+    #[track_caller]
+    #[cold]
+    #[inline(never)]
+    fn from(source: CliError) -> Self {
+        Self::new(AppErrorKind::Cli(source))
+    }
+}
+
+impl From<ArchiveError> for AppError {
+    #[track_caller]
+    #[cold]
+    #[inline(never)]
+    fn from(source: ArchiveError) -> Self {
+        Self::new(AppErrorKind::Archive(source))
+    }
+}
+
+impl From<InputError> for AppError {
+    #[track_caller]
+    #[cold]
+    #[inline(never)]
+    fn from(source: InputError) -> Self {
+        Self::new(AppErrorKind::Input(source))
+    }
+}
+
+impl From<PipelineError> for AppError {
+    #[track_caller]
+    #[cold]
+    #[inline(never)]
+    fn from(source: PipelineError) -> Self {
+        Self::new(AppErrorKind::Pipeline(source))
     }
 }

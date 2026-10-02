@@ -1,13 +1,10 @@
-mod rle;
 mod deflate;
-mod utils;
 mod huffman;
 mod lzss;
 
 pub use deflate::DeflateCompressor;
-pub use huffman::HuffmanCompressor;
-pub use lzss::LzssCompressor;
-pub use rle::RleCompressor;
+pub use huffman::{HuffmanCompressor, HuffmanError};
+pub use lzss::{LzssCompressor, LzssError};
 
 use super::ids::CompressionId;
 use crate::archiver::{ArchivedArtifactEntry, Artifact};

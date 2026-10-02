@@ -6,6 +6,7 @@ use std::thread;
 use crate::algorithms::PipelineSettings;
 use crate::archiver::{ArchivedArtifactEntry, Artifact, WalkedFile};
 use crate::error::AppError;
+use crate::archiver::PipelineError;
 use super::one_file::pack_file;
 
 const MAX_PARALLELISM: usize = usize::MAX;
@@ -32,7 +33,7 @@ pub fn pack_files_parallel(
         for worker in workers {
             worker
                 .join()
-                .map_err(|_| AppError::Compression("Паника в рабочем потоке".into()))??;
+                .map_err(|_| PipelineError::WorkerPanicked)??;
         }
 
         Ok(())

@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::time::Instant;
 
-use colored::Colorize;
+use owo_colors::OwoColorize;
 
 use rustarch::algorithms::{CipherId, CompressionId, FecId, PipelineSettings};
 use rustarch::cli::{CLICommand, parse_args, run_command};
@@ -24,16 +24,16 @@ const QUICK_SETTINGS: PipelineSettings = PipelineSettings {
 };
 
 
-const QUICK_RUN_MODE: QuickRunMode = QuickRunMode::Release; // <==============================
-const QUICK_SOURCE_PATH: &str = r"C:\Users\alex\Desktop\Тестовые данные для архиватора\Низкая энтропия\Текст";
-const QUICK_ARCHIVE_PATH: &str = r".\test_data_for_removing\study.arch";
+const QUICK_RUN_MODE: QuickRunMode = QuickRunMode::Pack; // <==============================
+const QUICK_SOURCE_PATH: &str = r"C:\Games\Battlefield 2142 Novgames RST";
+const QUICK_ARCHIVE_PATH: &str = r".\battlefield.arch";
 const QUICK_UNPACK_PATH: &str = r".\test_data_for_removing\unpacked";
 const QUICK_WORKERS_FOR_GROUPING: usize = 16;
 
 
 fn main() {
     #[cfg(windows)] // Для Коли. Чтобы даже в cmd.exe был цветной текст. До этого его не было
-    let _ = colored::control::set_virtual_terminal(true);
+    let _ = enable_ansi_support::enable_ansi_support();
 
     let cli_command: CLICommand = match QUICK_RUN_MODE {
         QuickRunMode::Pack => CLICommand::Pack {
@@ -83,7 +83,7 @@ fn main() {
     );
 
     if let Err(error) = execution_result {
-        eprintln!("{} {error}", "Ошибка:".red().bold());
+        eprintln!("{} {error:?}", "Ошибка:".red().bold());
         std::process::exit(1);
     }
 
@@ -96,7 +96,7 @@ fn main() {
                         metadata.len() as f64 / 1024_f64.powi(3),
                         metadata.len(),
                     );
-                    println!("{} {}", "===> TOTAL SIZE:".bold(), size.cyan());
+                    println!("{} {}", "===> TOTAL SIZE:".bold(), size.blue());
                 }
 
                 Err(error) => eprintln!(
@@ -137,7 +137,7 @@ fn run_quick_grouping() -> Result<(), AppError> {
 
     println!(
         "{} {}",
-        "Время группировки:".bold(),
+        "Время группировки + чтение файловых директорий:".bold(),
         format!("{}ms", started.elapsed().as_millis()).cyan(),
     );
 

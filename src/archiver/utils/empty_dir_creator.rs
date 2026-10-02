@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 use crate::archiver::ArchivedDirectoryEntry;
 use crate::error::AppError;
+use crate::archiver::ArchiveError;
 
 
 pub fn create_empty_dirs(root: &Path, target_empty_dirs: &[ArchivedDirectoryEntry]) -> Result<(), AppError> {
@@ -23,9 +24,7 @@ pub fn resolve_output_path(output_dir: &Path, relative_path: &str) -> Result<Pat
             continue;
         }
         if part == ".." {
-            return Err(AppError::CorruptArchive(format!(
-                "Путь записи содержит '..' - потенциально небезопасный архив: '{relative_path}'"
-            )));
+            return Err(ArchiveError::UnsafePath { path: relative_path.into() }.into());
         }
         result.push(part);
     }

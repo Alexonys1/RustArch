@@ -4,6 +4,7 @@ use std::path::Path;
 use std::thread;
 
 use crate::error::AppError;
+use crate::archiver::PipelineError;
 use crate::archiver::ArchivedArtifactEntry;
 use super::one_file::unpack_file;
 
@@ -34,7 +35,7 @@ pub fn unpack_entries_parallel(
         for worker in workers {
             worker
                 .join()
-                .map_err(|_| AppError::Compression("Паника в рабочем потоке".into()))??;
+                .map_err(|_| PipelineError::WorkerPanicked)??;
         }
 
         Ok(())

@@ -2,10 +2,11 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::PathBuf;
 
-use colored::Colorize;
+use owo_colors::OwoColorize;
 
 use crate::algorithms::{CipherId, CompressionId, FecId, PipelineSettings};
 use crate::error::AppError;
+use super::CliError;
 
 
 #[derive(Debug, Clone)]
@@ -37,7 +38,7 @@ pub const HELP: &str = r#"rustarch - многопоточный архивато
     rustarch help
 
 КОМАНДА pack:
-    -c, --compression <ALGORITHM>   none | rle | huffman | lzss | deflate
+    -c, --compression <ALGORITHM>   none | huffman | lzss | deflate
                                     По умолчанию: deflate
         --cipher <ALGORITHM>        none | xor. По умолчанию: none
         --fec <ALGORITHM>           none | reed-solomon. По умолчанию: none
@@ -101,10 +102,8 @@ where
         Some("list") | Some("ls") | Some("l") => parse_list(args),
         Some("help") | Some("-h") | Some("--help") => Ok(CLICommand::Help),
         Some("version") | Some("-V") | Some("--version") => Ok(CLICommand::Version),
-        Some(other) => Err(usage_error(format!("Неизвестная команда '{other}'"))),
-        None => Err(usage_error(
-            "Имя команды не является валидной UTF-8 строкой",
-        )),
+        Some(other) => Err(CliError::UnknownCommand { name: other.into() }.into()),
+        None => Err(CliError::InvalidCommandUtf8.into()),
     }
 }
 
@@ -142,7 +141,7 @@ fn parse_pack(args: Vec<OsString>) -> Result<CLICommand, AppError> {
                         | "--key-hex"
                         | "--key-file"
                 ) {
-                    return Err(usage_error(format!("неизвестная опция pack: {name}")));
+                    return Err(CliError::UnknownOption { command: "pack", name: name.into() }.into());
                 }
 
                 let value = option_value(&args, &mut index, name, inline_value)?;
@@ -155,7 +154,7 @@ fn parse_pack(args: Vec<OsString>) -> Result<CLICommand, AppError> {
                     "--key" => set_once(&mut key, KeySource::Text(value.to_os_string()), "key")?,
                     "--key-hex" => {
                         let text = value.to_str().ok_or_else(|| {
-                            usage_error("значение --key-hex не является UTF-8 строкой")
+                            CliError::InvalidOptionValueUtf8 { option: "--key-hex".into() }
                         })?;
                         set_once(&mut key, KeySource::Bytes(parse_hex_key(text)?), "key")?;
                     }
@@ -174,7 +173,7 @@ fn parse_pack(args: Vec<OsString>) -> Result<CLICommand, AppError> {
     }
 
     if positionals.len() != 2 {
-        return Err(usage_error("pack ожидает два пути: <SOURCE> <ARCHIVE>"));
+        return Err(CliError::InvalidPackArguments.into());
     }
 
     let cipher = cipher.unwrap_or(CipherId::NoCipher);
@@ -216,7 +215,7 @@ fn parse_unpack(args: Vec<OsString>) -> Result<CLICommand, AppError> {
                     return Ok(CLICommand::Version);
                 }
                 if !matches!(name, "--key" | "--key-hex" | "--key-file") {
-                    return Err(usage_error(format!("неизвестная опция unpack: {name}")));
+                    return Err(CliError::UnknownOption { command: "unpack", name: name.into() }.into());
                 }
 
                 let value = option_value(&args, &mut index, name, inline_value)?;
@@ -224,7 +223,7 @@ fn parse_unpack(args: Vec<OsString>) -> Result<CLICommand, AppError> {
                     "--key" => set_once(&mut key, KeySource::Text(value.to_os_string()), "key")?,
                     "--key-hex" => {
                         let text = value.to_str().ok_or_else(|| {
-                            usage_error("значение --key-hex не является UTF-8 строкой")
+                            CliError::InvalidOptionValueUtf8 { option: "--key-hex".into() }
                         })?;
                         set_once(&mut key, KeySource::Bytes(parse_hex_key(text)?), "key")?;
                     }
@@ -243,9 +242,7 @@ fn parse_unpack(args: Vec<OsString>) -> Result<CLICommand, AppError> {
     }
 
     if positionals.len() != 2 {
-        return Err(usage_error(
-            "unpack ожидает два пути: <ARCHIVE> <DESTINATION>",
-        ));
+        return Err(CliError::InvalidUnpackArguments.into());
     }
 
     Ok(CLICommand::Unpack {
@@ -270,19 +267,18 @@ fn parse_list(args: Vec<OsString>) -> Result<CLICommand, AppError> {
 
     let archive_path = match args.as_slice() {
         [path] if path.to_str().is_some_and(|text| text.starts_with('-')) => {
-            return Err(usage_error(format!(
-                "неизвестная опция list: {}",
-                path.to_string_lossy()
-            )));
+            return Err(CliError::UnknownOption {
+                command: "list", name: path.to_string_lossy().into_owned(),
+            }.into());
         }
         [path] => path.clone(),
         [separator, path] if separator.as_os_str() == OsStr::new("--") => path.clone(),
         _ => {
-            return Err(usage_error("list ожидает один путь: <ARCHIVE>"));
+            return Err(CliError::InvalidListArguments.into());
         }
     };
     if archive_path.as_os_str().is_empty() {
-        return Err(usage_error("list ожидает один путь: <ARCHIVE>"));
+        return Err(CliError::InvalidListArguments.into());
     }
     Ok(CLICommand::ShowArchiveInnerStructure {
         archive_path: PathBuf::from(archive_path),
@@ -292,7 +288,7 @@ fn parse_list(args: Vec<OsString>) -> Result<CLICommand, AppError> {
 fn split_option(arg: &OsStr) -> Result<Option<(&str, Option<&OsStr>)>, AppError> {
     let Some(text) = arg.to_str() else {
         if arg.as_encoded_bytes().first() == Some(&b'-') {
-            return Err(usage_error("имя опции не является валидной UTF-8 строкой"));
+            return Err(CliError::InvalidOptionNameUtf8.into());
         }
         return Ok(None);
     };
@@ -316,9 +312,7 @@ fn option_value<'a>(
 ) -> Result<&'a OsStr, AppError> {
     if let Some(value) = inline {
         if value.is_empty() {
-            return Err(usage_error(format!(
-                "опция {name} получила пустое значение"
-            )));
+            return Err(CliError::EmptyOptionValue { option: name.into() }.into());
         }
         return Ok(value);
     }
@@ -326,12 +320,12 @@ fn option_value<'a>(
     *index += 1;
     args.get(*index)
         .map(OsString::as_os_str)
-        .ok_or_else(|| usage_error(format!("после {name} ожидается значение")))
+        .ok_or_else(|| AppError::from(CliError::MissingOptionValue { option: name.into() }))
 }
 
 fn set_once<T>(slot: &mut Option<T>, value: T, name: &str) -> Result<(), AppError> {
     if slot.replace(value).is_some() {
-        return Err(usage_error(format!("опция {name} указана несколько раз")));
+        return Err(CliError::DuplicateOption { option: name.into() }.into());
     }
     Ok(())
 }
@@ -339,13 +333,10 @@ fn set_once<T>(slot: &mut Option<T>, value: T, name: &str) -> Result<(), AppErro
 fn parse_compression(value: &OsStr) -> Result<CompressionId, AppError> {
     match normalized(value, "compression")?.as_str() {
         "none" | "store" => Ok(CompressionId::NoCompression),
-        "rle" => Ok(CompressionId::RLE),
         "huffman" | "huff" => Ok(CompressionId::Huffman),
         "lzss" => Ok(CompressionId::LZSS),
         "deflate" => Ok(CompressionId::Deflate),
-        other => Err(usage_error(format!(
-            "неизвестный алгоритм сжатия '{other}'"
-        ))),
+        other => Err(CliError::UnknownCompression { name: other.into() }.into()),
     }
 }
 
@@ -353,7 +344,7 @@ fn parse_cipher(value: &OsStr) -> Result<CipherId, AppError> {
     match normalized(value, "cipher")?.as_str() {
         "none" => Ok(CipherId::NoCipher),
         "xor" => Ok(CipherId::Xor),
-        other => Err(usage_error(format!("неизвестный шифр '{other}'"))),
+        other => Err(CliError::UnknownCipher { name: other.into() }.into()),
     }
 }
 
@@ -361,10 +352,8 @@ fn parse_fec(value: &OsStr) -> Result<FecId, AppError> {
     match normalized(value, "fec")?.as_str() {
         "none" => Ok(FecId::NoFec),
         "reed-solomon" | "reed_solomon" | "rs" => Ok(FecId::ReedSolomon),
-        "hamming7-4" | "hamming15-11" => Err(usage_error(
-            "Hamming пока не подключён к pipeline; используйте none или reed-solomon",
-        )),
-        other => Err(usage_error(format!("неизвестный FEC '{other}'"))),
+        "hamming7-4" | "hamming15-11" => Err(CliError::UnsupportedHamming.into()),
+        other => Err(CliError::UnknownFec { name: other.into() }.into()),
     }
 }
 
@@ -372,7 +361,7 @@ fn normalized(value: &OsStr, option: &str) -> Result<String, AppError> {
     value
         .to_str()
         .map(str::to_ascii_lowercase)
-        .ok_or_else(|| usage_error(format!("значение --{option} не является UTF-8 строкой")))
+        .ok_or_else(|| AppError::from(CliError::InvalidOptionValueUtf8 { option: format!("--{option}") }))
 }
 
 enum KeySource {
@@ -387,13 +376,10 @@ fn load_key(source: Option<KeySource>) -> Result<Vec<u8>, AppError> {
         Some(KeySource::Text(text)) => text
             .into_string()
             .map(String::into_bytes)
-            .map_err(|_| usage_error("значение --key не является UTF-8 строкой")),
+            .map_err(|_| AppError::from(CliError::InvalidOptionValueUtf8 { option: "--key".into() })),
         Some(KeySource::Bytes(bytes)) => Ok(bytes),
         Some(KeySource::File(path)) => fs::read(&path).map_err(|error| {
-            AppError::CLIUsage(format!(
-                "не удалось прочитать файл ключа '{}': {error}",
-                path.display()
-            ))
+            AppError::from(CliError::KeyFileRead { path, source: error })
         }),
     }?;
 
@@ -408,9 +394,7 @@ fn parse_hex_key(text: &str) -> Result<Vec<u8>, AppError> {
         .collect();
 
     if digits.is_empty() || digits.len() % 2 != 0 {
-        return Err(usage_error(
-            "--key-hex должен содержать ненулевое чётное число hex-цифр",
-        ));
+        return Err(CliError::InvalidHexKeyLength.into());
     }
 
     digits
@@ -428,25 +412,14 @@ fn hex_digit(byte: u8) -> Result<u8, AppError> {
         b'0'..=b'9' => Ok(byte - b'0'),
         b'a'..=b'f' => Ok(byte - b'a' + 10),
         b'A'..=b'F' => Ok(byte - b'A' + 10),
-        _ => Err(usage_error(format!(
-            "недопустимый символ в --key-hex: '{}'",
-            char::from(byte)
-        ))),
+        _ => Err(CliError::InvalidHexDigit { byte }.into()),
     }
 }
 
 fn validate_pack_key(cipher: CipherId, key: &[u8]) -> Result<(), AppError> {
     match (cipher, key.is_empty()) {
-        (CipherId::Xor, true) => Err(usage_error(
-            "для --cipher xor требуется --key, --key-hex или --key-file",
-        )),
-        (CipherId::NoCipher, false) => Err(usage_error(
-            "ключ указан, но шифрование выключено; добавьте --cipher xor",
-        )),
+        (CipherId::Xor, true) => Err(CliError::MissingXorKey.into()),
+        (CipherId::NoCipher, false) => Err(CliError::KeyWithoutCipher.into()),
         _ => Ok(()),
     }
-}
-
-fn usage_error(message: impl Into<String>) -> AppError {
-    AppError::CLIUsage(message.into())
 }

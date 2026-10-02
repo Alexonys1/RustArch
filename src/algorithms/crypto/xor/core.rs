@@ -3,7 +3,8 @@ use std::slice;
 
 use crate::error::AppError;
 use crate::archiver::Artifact;
-use super::{Cipher, CipherId};
+use crate::algorithms::crypto::{Cipher, CipherId};
+use super::XorError;
 
 
 pub struct XorCipher;
@@ -13,8 +14,9 @@ impl Cipher for XorCipher {
     fn transform(&self, mut artifact: Artifact, key: &[u8]) -> Result<Artifact, AppError> {
         self.validate_key(key)?;
 
+        // TODO: Я написал метод для чтения данных с памяти, но при этом всё равно его здесь не использовал :D
         if artifact.on_disk() { // Вот эта оптимизация выигрывает ~100мс, что немного. Зря делал.
-            let mut output = Artifact::new_with_temp_file_suffix(&artifact, "encoded");
+            let mut output: Artifact = Artifact::new_with_temp_file_suffix(&artifact, "encoded")?;
             let mut key_pos: usize = 0;
 
             while let Some(chunk) = artifact.next_chunk()? {
@@ -57,7 +59,7 @@ impl Cipher for XorCipher {
 
     fn validate_key(&self, key: &[u8]) -> Result<(), AppError> {
         if key.is_empty() {
-            return Err(AppError::Crypto("XOR: Ключ не может быть пустым!".to_string()));
+            return Err(XorError::EmptyKey.into());
         }
         Ok(())
     }

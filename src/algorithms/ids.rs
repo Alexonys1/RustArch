@@ -1,4 +1,5 @@
 use crate::error::AppError;
+use crate::archiver::ArchiveError;
 use super::{Compressor, compression};
 use super::{Cipher, crypto};
 use super::{ErrorCorrectionCode, fec};
@@ -7,10 +8,9 @@ use super::{ErrorCorrectionCode, fec};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompressionId {
     NoCompression = 0,
-    RLE = 1,
-    Huffman = 2,
-    LZSS = 3,
-    Deflate = 4,
+    Huffman = 1,
+    LZSS = 2,
+    Deflate = 3,
 }
 
 
@@ -23,7 +23,6 @@ impl CompressionId {
         use CompressionId::*;
         match self {
             NoCompression => Box::new(compression::NoneCompressor),
-            RLE => Box::new(compression::RleCompressor),
             Huffman => Box::new(compression::HuffmanCompressor),
             LZSS => Box::new(compression::LzssCompressor),
             Deflate => Box::new(compression::DeflateCompressor),
@@ -34,20 +33,16 @@ impl CompressionId {
         use CompressionId::*;
         match v {
             0 => Ok(NoCompression),
-            1 => Ok(RLE),
-            2 => Ok(Huffman),
-            3 => Ok(LZSS),
-            4 => Ok(Deflate),
-            other => Err(AppError::CorruptArchive(format!(
-                "Неизвестный compression_id: {other}"
-            ))),
+            1 => Ok(Huffman),
+            2 => Ok(LZSS),
+            3 => Ok(Deflate),
+            other => Err(ArchiveError::UnknownCompressionId { id: other }.into()),
         }
     }
     
     pub const fn as_str(self) -> &'static str {
         match self {
             CompressionId::NoCompression => "none",
-            CompressionId::RLE => "rle",
             CompressionId::Huffman => "huffman",
             CompressionId::LZSS => "lzss",
             CompressionId::Deflate => "deflate",
@@ -80,9 +75,7 @@ impl CipherId {
         match v {
             0 => Ok(NoCipher),
             1 => Ok(Xor),
-            other => Err(AppError::CorruptArchive(format!(
-                "Неизвестный cipher_id: {other}"
-            ))),
+            other => Err(ArchiveError::UnknownCipherId { id: other }.into()),
         }
     }
     
@@ -119,9 +112,7 @@ impl FecId {
         match v {
             0 => Ok(NoFec),
             1 => Ok(ReedSolomon),
-            other => Err(AppError::CorruptArchive(format!(
-                "Неизвестный fec_id: {other}"
-            ))),
+            other => Err(ArchiveError::UnknownFecId { id: other }.into()),
         }
     }
     

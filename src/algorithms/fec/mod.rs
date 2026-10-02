@@ -1,10 +1,10 @@
 mod reed_solomon;
 
-pub use reed_solomon::ReedSolomonCode;
+pub use reed_solomon::{ReedSolomonCode, ReedSolomonError};
 
 use crate::error::AppError;
 use crate::archiver::Artifact;
-use super::FecId;
+use crate::algorithms::FecId;
 
 
 #[derive(Debug, Clone, Copy, Default)]

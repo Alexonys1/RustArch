@@ -4,6 +4,7 @@ use std::path::Path;
 
 use crate::algorithms::PipelineSettings;
 use crate::error::AppError;
+use crate::archiver::ArchiveError;
 
 
 pub const MAGIC: [u8; 4] = *b"RARC";
@@ -62,11 +63,11 @@ pub fn write_archive_header(
     let table_end: u64 = archive_file.stream_position()?;
     let table_size: u64 = table_end
         .checked_sub(table_offset)
-        .ok_or_else(|| AppError::CorruptArchive("Некорректный размер таблиц".into()))?;
+        .ok_or_else(|| AppError::from(ArchiveError::InvalidTableSize))?;
     let file_count: u32 = u32::try_from(archived_files.len())
-        .map_err(|_| AppError::CorruptArchive("Количество файлов превышает u32::MAX".into()))?;
+        .map_err(|_| AppError::from(ArchiveError::TooManyFiles { count: archived_files.len() }))?;
     let directory_count: u32 = u32::try_from(archived_directories.len())
-        .map_err(|_| AppError::CorruptArchive("Количество директорий превышает u32::MAX".into()))?;
+        .map_err(|_| AppError::from(ArchiveError::TooManyDirectories { count: archived_directories.len() }))?;
 
     ArchiveFooter {
         table_offset,
@@ -88,9 +89,9 @@ pub fn read_archive_entries(file: &mut File) -> Result<(Vec<ArchivedArtifactEntr
     file.seek(SeekFrom::Start(footer.table_offset))?;
 
     let file_capacity: usize = usize::try_from(footer.file_count)
-        .map_err(|_| AppError::CorruptArchive("Слишком много файловых записей".into()))?;
+        .map_err(|_| AppError::from(ArchiveError::FileCountExceedsPlatformLimit { count: footer.file_count }))?;
     let directory_capacity = usize::try_from(footer.directory_count)
-        .map_err(|_| AppError::CorruptArchive("Слишком много записей директорий".into()))?;
+        .map_err(|_| AppError::from(ArchiveError::DirectoryCountExceedsPlatformLimit { count: footer.directory_count }))?;
 
     let mut files: Vec<ArchivedArtifactEntry> = Vec::with_capacity(file_capacity);
     for _ in 0..footer.file_count {
@@ -105,9 +106,7 @@ pub fn read_archive_entries(file: &mut File) -> Result<(Vec<ArchivedArtifactEntr
     }
 
     if file.stream_position()? != table_end {
-        return Err(AppError::CorruptArchive(
-            "Размер таблиц не совпадает с количеством записей!".into(),
-        ));
+        return Err(AppError::from(ArchiveError::TableSizeMismatch));
     }
 
     validate_payload_ranges(&files, footer.table_offset)?;
@@ -180,9 +179,7 @@ impl ArchiveFooter {
     fn read_from(file: &mut File) -> Result<Self, AppError> {
         let archive_size = file.metadata()?.len();
         if archive_size < FOOTER_SIZE {
-            return Err(AppError::CorruptArchive(
-                "Архив слишком короткий для footer".into(),
-            ));
+            return Err(AppError::from(ArchiveError::ArchiveTooShort));
         }
 
         file.seek(SeekFrom::Start(archive_size - FOOTER_SIZE))?;
@@ -190,23 +187,17 @@ impl ArchiveFooter {
         let mut magic = [0u8; 4];
         file.read_exact(&mut magic)?;
         if magic != MAGIC {
-            return Err(AppError::CorruptArchive(
-                "Неверная сигнатура footer архива".into(),
-            ));
+            return Err(AppError::from(ArchiveError::InvalidSignature));
         }
 
         let version = read_u16(file)?;
         if version != FORMAT_VERSION {
-            return Err(AppError::CorruptArchive(format!(
-                "Неподдерживаемая версия формата: {version} (ожидалась {FORMAT_VERSION})"
-            )));
+            return Err(AppError::from(ArchiveError::UnsupportedVersion { version, expected: FORMAT_VERSION }));
         }
 
         let flags = read_u16(file)?;
         if flags != 0 {
-            return Err(AppError::CorruptArchive(format!(
-                "Неизвестные флаги архива: {flags:#x}"
-            )));
+            return Err(AppError::from(ArchiveError::UnknownArchiveFlags { flags }));
         }
 
         let footer = Self {
@@ -217,9 +208,7 @@ impl ArchiveFooter {
         };
 
         if footer.table_end()? != archive_size - FOOTER_SIZE {
-            return Err(AppError::CorruptArchive(
-                "Некорректные границы таблиц архива".into(),
-            ));
+            return Err(AppError::from(ArchiveError::InvalidTableBounds));
         }
 
         Ok(footer)
@@ -228,7 +217,7 @@ impl ArchiveFooter {
     fn table_end(self) -> Result<u64, AppError> {
         self.table_offset
             .checked_add(self.table_size)
-            .ok_or_else(|| AppError::CorruptArchive("Переполнение размера таблиц".into()))
+            .ok_or_else(|| AppError::from(ArchiveError::TableSizeOverflow))
     }
 }
 
@@ -236,7 +225,7 @@ impl ArchiveFooter {
 fn write_path<Writer: Write>(writer: &mut Writer, path: &str) -> Result<(), AppError> {
     let bytes = path.as_bytes();
     let length = u16::try_from(bytes.len()).map_err(|_| {
-        AppError::CorruptArchive(format!("Путь слишком длинный: {} байт", bytes.len()))
+        AppError::from(ArchiveError::PathTooLong { length: bytes.len() })
     })?;
 
     writer.write_all(&length.to_le_bytes())?;
@@ -250,15 +239,13 @@ fn read_path<Reader: Read>(reader: &mut Reader) -> Result<String, AppError> {
     let mut bytes = vec![0u8; length];
     reader.read_exact(&mut bytes)?;
     String::from_utf8(bytes)
-        .map_err(|_| AppError::CorruptArchive("Путь записи не является валидным UTF-8".into()))
+        .map_err(|source| ArchiveError::InvalidPathUtf8(source).into())
 }
 
 
 fn ensure_inside_table(file: &mut File, table_end: u64) -> Result<(), AppError> {
     if file.stream_position()? > table_end {
-        return Err(AppError::CorruptArchive(
-            "Запись выходит за пределы своей таблицы".into(),
-        ));
+        return Err(AppError::from(ArchiveError::EntryOutsideTable));
     }
     Ok(())
 }
@@ -274,17 +261,11 @@ pub fn validate_payload_ranges(files: &[ArchivedArtifactEntry], payload_end: u64
             .payload_offset
             .checked_add(entry.stored_size)
             .ok_or_else(|| {
-                AppError::CorruptArchive(format!(
-                    "Переполнение payload диапазона '{}'",
-                    entry.relative_path
-                ))
+                AppError::from(ArchiveError::PayloadRangeOverflow { path: entry.relative_path.clone() })
             })?;
 
         if end > payload_end {
-            return Err(AppError::CorruptArchive(format!(
-                "Payload '{}' выходит за пределы payload-секции",
-                entry.relative_path
-            )));
+            return Err(AppError::from(ArchiveError::PayloadOutsideSection { path: entry.relative_path.clone() }));
         }
 
         if entry.stored_size != 0 {
@@ -296,17 +277,13 @@ pub fn validate_payload_ranges(files: &[ArchivedArtifactEntry], payload_end: u64
     let mut expected_offset = 0;
     for (start, end) in ranges {
         if start != expected_offset {
-            return Err(AppError::CorruptArchive(
-                "Payload'ы не образуют непрерывную непересекающуюся секцию".into(),
-            ));
+            return Err(AppError::from(ArchiveError::InvalidPayloadLayout));
         }
         expected_offset = end;
     }
 
     if expected_offset != payload_end {
-        return Err(AppError::CorruptArchive(
-            "Конец payload-секции не совпадает с началом таблиц".into(),
-        ));
+        return Err(AppError::from(ArchiveError::PayloadEndMismatch));
     }
 
     Ok(())
@@ -319,24 +296,15 @@ pub fn validate_empty_artifact_entry(entry: &ArchivedArtifactEntry) -> Result<()
     }
 
     if entry.stored_size != 0 {
-        return Err(AppError::CorruptArchive(format!(
-            "Пустой файл '{}' содержит ненулевой payload",
-            entry.relative_path
-        )));
+        return Err(AppError::from(ArchiveError::EmptyFileHasPayload { path: entry.relative_path.clone() }));
     }
 
     if entry.pipeline != PipelineSettings::default() {
-        return Err(AppError::CorruptArchive(format!(
-            "Пустой файл '{}' содержит ненулевой pipeline",
-            entry.relative_path
-        )));
+        return Err(AppError::from(ArchiveError::EmptyFileHasPipeline { path: entry.relative_path.clone() }));
     }
 
     if entry.crc32 != u32::MAX {
-        return Err(AppError::CorruptArchive(format!(
-            "Пустой файл '{}' содержит некорректную CRC32-заглушку",
-            entry.relative_path
-        )));
+        return Err(AppError::from(ArchiveError::InvalidEmptyFileChecksum { path: entry.relative_path.clone() }));
     }
 
     Ok(())

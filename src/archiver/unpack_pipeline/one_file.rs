@@ -48,9 +48,7 @@ pub fn unpack_file(
     let actual_crc32 = crc32_of_artifact_and_rewind(&mut check_artifact, entry.pipeline)?;
 
     if actual_crc32 != entry.crc32 {
-        return Err(AppError::ChecksumMismatch {
-            path: output_path.display().to_string(),
-        });
+        return Err(AppError::checksum_mismatch(output_path));
     }
 
     Ok(())

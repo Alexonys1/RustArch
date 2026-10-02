@@ -1,9 +1,10 @@
 use crate::error::AppError;
 use crate::archiver::{ArchivedArtifactEntry, Artifact};
 use crate::algorithms::compression::{CompressionId, Compressor};
-use crate::algorithms::compression::huffman::bit_handlers::{BitWindow, StreamingBitWriter};
-use crate::algorithms::compression::huffman::decode_table::{build_decode_table, DecodeEntry};
+use super::bit_handlers::{BitWindow, StreamingBitWriter};
+use super::decode_table::{build_decode_table, DecodeEntry};
 use super::tree_bulder::{SymbolWithFreq, NodeOfHuffmanTree, HuffmanCode, create_huffman_codes, build_tree};
+use super::error::HuffmanError;
 
 
 /// Это размер небольшого буфера, в котором лежит кусочек сжатых данных.
@@ -31,13 +32,11 @@ impl Compressor for HuffmanCompressor {
 
     fn decompress(&self, mut artifact: Artifact, _: &ArchivedArtifactEntry) -> Result<Artifact, AppError> {
         // ============================ ЧИТАЕМ ЗАГОЛОВОК ФАЙЛА ==========================
-        let mut output = Artifact::new_with_temp_file_suffix(&artifact, "decompressed");
+        let mut output = Artifact::new_with_temp_file_suffix(&artifact, "decompressed")?;
 
         let nonzero_freqs_count: usize = artifact.read_le_u16()? as usize;
         if nonzero_freqs_count > ALPHABET_SIZE {
-            return Err(AppError::CorruptArchive(
-                "Huffman: Число символов превышает размер алфавита!".into(),
-            ));
+            return Err(HuffmanError::TooManySymbols { count: nonzero_freqs_count }.into());
         }
 
         let mut nonzero_freqs: Vec<SymbolWithFreq> = Vec::with_capacity(nonzero_freqs_count);
@@ -48,25 +47,23 @@ impl Compressor for HuffmanCompressor {
             let symbol: u8 = artifact.read_le_u8()?;
             let freq: u64 = artifact.read_le_u64()?;
 
-            if freq == 0 || seen[symbol as usize] {
-                return Err(AppError::CorruptArchive(
-                    "Huffman: Некорректная таблица частот!".into(),
-                ));
+            if freq == 0 {
+                return Err(HuffmanError::ZeroFrequency { symbol }.into());
+            }
+            if seen[symbol as usize] {
+                return Err(HuffmanError::DuplicateSymbol { symbol }.into());
             }
 
             seen[symbol as usize] = true;
-            frequency_sum = frequency_sum.checked_add(freq).ok_or_else(|| {
-                AppError::CorruptArchive("Huffman: Переполнение суммы частот!".into())
-            })?;
+            frequency_sum = frequency_sum.checked_add(freq)
+                .ok_or(HuffmanError::FrequencySumOverflow)?;
             nonzero_freqs.push(SymbolWithFreq { symbol, freq });
         }
 
         let original_size: u64 = frequency_sum;
 
         if original_size == 0 {
-            return Err(AppError::CorruptArchive(
-                "Huffman: пустой поток должен храниться без сжатия".into(),
-            ));
+            return Err(HuffmanError::EmptyEncodedStream.into());
         }
 
         if nonzero_freqs.len() == 1 {
@@ -161,7 +158,7 @@ impl HuffmanCompressor {
 
         //TODO: Со временем мне кажется, что разбиение кода на функции лучше, чем добавление всюду комментариев.
         // Но это требует больших усилий при программировании.
-        // Зато получается более читаемый код (см. мой парсер ассемблера RISK-V).
+        // Зато получается более читаемый код (см. мой парсер ассемблера RISC-V).
 
         // ============================== СЧИТАЕМ ЧАСТОТЫ ================================
         let mut freqs = [0_u64; ALPHABET_SIZE]; // Индекс и есть сам символ (чтобы не забыть)
@@ -199,7 +196,7 @@ impl HuffmanCompressor {
         }
 
         if nonzero_freqs.len() == 1 {
-            let mut output = Artifact::new_with_temp_file_suffix(&artifact, "compressed");
+            let mut output = Artifact::new_with_temp_file_suffix(&artifact, "compressed")?;
             write_header(&mut output, &nonzero_freqs)?;
             return Ok((output, CompressionId::Huffman));
         }
@@ -226,7 +223,7 @@ impl HuffmanCompressor {
 
 
         // =============================== НЕПОСРЕДСТВЕННО, СЖАТИЕ =================================
-        let mut output_artifact = Artifact::new_with_temp_file_suffix(&artifact, "compressed");
+        let mut output_artifact = Artifact::new_with_temp_file_suffix(&artifact, "compressed")?;
         write_header(&mut output_artifact, &nonzero_freqs)?;
 
         let mut writer = StreamingBitWriter::new(&mut output_artifact);

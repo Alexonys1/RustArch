@@ -1,13 +1,15 @@
 use std::io::{self, Read, Write, Seek, SeekFrom};
 use std::fs::{self, File, OpenOptions};
 use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::Ordering;
 use std::path::{Path, PathBuf};
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::borrow::Cow;
 
 use crate::error::AppError;
-use super::memory_budget::BudgetGuard;
+use crate::archiver::ArchiveError;
+use super::memory_budget::{BudgetGuard, MEMORY_BUDGET_IN_BYTES};
 
 
 pub const DEFAULT_CHUNK_SIZE_IN_BYTES: usize = 512 * 1024; // 512KB // Найдено опытным путём. Больше-меньше - хуже скорость на моей машине
@@ -17,8 +19,8 @@ pub const DEFAULT_CHUNK_SIZE_IN_BYTES: usize = 512 * 1024; // 512KB // Найд�
 
 pub struct Artifact {
     pub chunk_size: NonZeroUsize,
-    file_path: PathBuf,
     state: ArtifactState,
+    file_path: PathBuf,
     is_temp_file: bool,
     reading_position: usize,
     writing_position: usize,
@@ -65,14 +67,35 @@ impl Artifact {
     }
 
     // TODO: Ужасное название... Было, но лучше не стало.
-    pub fn new_with_temp_file_suffix(artifact: &Artifact, suffix: &str) -> Artifact {
-        Artifact {
-            chunk_size: artifact.chunk_size,
-            file_path: make_numbered_temp_file_path(artifact.file_path.as_path(), suffix),
-            is_temp_file: true, // Новый производный артефакт - всегда наш собственный временный файл
-            state: ArtifactState::Memory { data: Vec::new(), budget_guard: BudgetGuard::default() },
-            reading_position: 0,
-            writing_position: 0,
+    pub fn new_with_temp_file_suffix(artifact: &Artifact, suffix: &str) -> Result<Artifact, AppError> {
+        if Self::should_artifact_be_placed_on_disk(artifact) {
+            let file_path: PathBuf = make_numbered_temp_file_path(artifact.file_path.as_ref(), suffix);
+            Ok(Artifact {
+                is_temp_file: true, // Новый артефакт - всегда наш собственный временный файл
+                state: ArtifactState::File {
+                    file: OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .create(true)
+                        .truncate(true)
+                        .open(&file_path)?,
+                    size: 0,
+                },
+                chunk_size: artifact.chunk_size,
+                reading_position: 0,
+                writing_position: 0,
+                file_path,
+            })
+        }
+        else {
+            Ok(Artifact {
+                chunk_size: artifact.chunk_size,
+                file_path: make_numbered_temp_file_path(artifact.file_path.as_ref(), suffix),
+                is_temp_file: true,
+                state: ArtifactState::Memory { data: Vec::new(), budget_guard: BudgetGuard::default() },
+                reading_position: 0,
+                writing_position: 0,
+            })
         }
     }
 
@@ -89,7 +112,7 @@ impl Artifact {
                 let mut source = file.try_clone()?; // отдельный курсор чтения, не мешающий остальным операциям с этим же file
                 source.seek(SeekFrom::Start(*base_offset))?;
 
-                let mut out = fs::File::create(new_path)?;
+                let mut out = File::create(new_path)?;
                 let mut remaining = *len;
                 let mut buffer = vec![0u8; self.chunk_size.get()];
 
@@ -116,20 +139,20 @@ impl Artifact {
         Ok(())
     }
 
-    /// Возвращает кол-во хранящихся байт без учёта курсора чтения/записи.
+    /// Возвращает кол-во хранящихся байт без учёта положения курсора чтения/записи.
     pub fn get_payload_size(&self) -> usize {
         match &self.state {
-            ArtifactState::File { size, .. } => *size,
+            ArtifactState::File     { size, .. } => *size,
             ArtifactState::Memory { data, .. } => data.len(),
-            ArtifactState::FileWindow { len, .. } => *len as usize,
+            ArtifactState::FileWindow  { len, .. } => *len as usize,
         }
     }
 
     pub fn on_disk(&self) -> bool {
         match &self.state {
-            ArtifactState::File { .. } => true,
+            ArtifactState::File       { .. } => true,
             ArtifactState::FileWindow { .. } => true,
-            _ => false,
+            _                                => false,
         }
     }
 
@@ -138,8 +161,8 @@ impl Artifact {
     }
 
     // TODO: Подумать над надобностью этой функции. Может, сигнатуру нужно переписать.
-    /// Если данные на диске, то будет возвращён None.
-    /// Если данные в оперативной памяти, то будет возвращён Some
+    /// Если данные на диске, то будет возвращён `None`.
+    /// Если данные в оперативной памяти, то будет возвращён `Some`.
     pub fn next_mut_chunk_from_memory(&mut self) -> io::Result<Option<&mut [u8]>> {
         match &mut self.state {
             ArtifactState::File { .. } => Ok(None),
@@ -155,8 +178,8 @@ impl Artifact {
         }
     }
 
-    /// Возвращает Ok(Some(Cow)) длиной <= chunk_size, если данные можно прочесть.
-    /// Если данные закончились (курсор уехал за пределы файла или массива), то вернётся Ok(None).
+    /// Возвращает `Ok(Some(Cow)) длиной <= chunk_size`, если данные можно прочесть.
+    /// Если данные закончились (курсор уехал за пределы файла или массива), то вернётся `Ok(None)`.
     pub fn next_chunk(&mut self) -> io::Result<Option<Cow<'_, [u8]>>> {
         match &mut self.state {
             ArtifactState::File { file, .. } => {
@@ -340,6 +363,10 @@ impl Artifact {
         ))
     }
 
+    fn should_artifact_be_placed_on_disk(artifact: &Artifact) -> bool {
+        artifact.get_payload_size() > MEMORY_BUDGET_IN_BYTES.load(Ordering::Acquire) as usize
+    }
+
     // Несмотря на свою устрашающую сигнатуру, она делает код чище. Я удивлён
     fn read_n_bytes<const N: usize>(&mut self) -> Result<[u8; N], AppError> {
         let mut buffer: [u8; N] = [0; N];
@@ -349,9 +376,7 @@ impl Artifact {
             let read_bytes: usize = self.read_chunk_to(&mut buffer[filled..])?;
 
             if read_bytes == 0 {
-                return Err(AppError::CorruptArchive(
-                    "Неожиданный конец потока при чтении!".into(),
-                ));
+                return Err(ArchiveError::UnexpectedEndOfData.into());
             }
 
             filled += read_bytes;
@@ -471,4 +496,87 @@ fn make_numbered_temp_file_path(old_path: &Path, suffix: &str) -> PathBuf {
     } else {
         format!("{}_{}.tmp", filename, suffix).into()
     }//.into() // А что лучше по читаемости?
+}
+
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::Artifact;
+    use super::super::memory_budget::TestMemoryBudget;
+
+    static TEST_FILE_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    struct TestSourceFile {
+        path: PathBuf,
+    }
+
+    impl TestSourceFile {
+        fn new(contents: &[u8]) -> Self {
+            let id = TEST_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "rustarch_artifact_unit_{}_{}",
+                std::process::id(),
+                id,
+            ));
+            fs::write(&path, contents).unwrap();
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            self.path.as_path()
+        }
+    }
+
+    impl Drop for TestSourceFile {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+
+    #[test]
+    fn derived_artifact_starts_on_disk_when_source_exceeds_budget() {
+        let budget = TestMemoryBudget::new(2);
+        let source_file = TestSourceFile::new(&[1, 2, 3]);
+        let source = Artifact::from_file(source_file.path()).unwrap();
+        let mut derived = Artifact::new_with_temp_file_suffix(&source, "starts_on_disk").unwrap();
+
+        assert!(derived.on_disk());
+        assert_eq!(budget.remaining(), 2);
+
+        derived.write_chunk_from(&[4, 5, 6]).unwrap();
+        derived.rewind_reading();
+
+        assert_eq!(derived.get_payload_size(), 3);
+        assert_eq!(derived.read_next_chunk_with_clone().unwrap().unwrap(), [4, 5, 6]);
+        assert!(derived.read_next_chunk_with_clone().unwrap().is_none());
+    }
+
+    #[test]
+    fn artifact_spills_to_disk_and_releases_reserved_memory() {
+        let budget = TestMemoryBudget::new(4);
+        let source_file = TestSourceFile::new(&[0]);
+        let source = Artifact::from_file(source_file.path()).unwrap();
+        let mut derived = Artifact::new_with_temp_file_suffix(&source, "spills_to_disk").unwrap();
+
+        assert!(!derived.on_disk());
+
+        derived.write_chunk_from(&[1, 2, 3]).unwrap();
+        assert_eq!(budget.remaining(), 1);
+
+        derived.write_chunk_from(&[4, 5]).unwrap();
+        assert!(derived.on_disk());
+        assert_eq!(budget.remaining(), 4);
+
+        derived.rewind_reading();
+        assert_eq!(derived.get_payload_size(), 5);
+        assert_eq!(
+            derived.read_next_chunk_with_clone().unwrap().unwrap(),
+            [1, 2, 3, 4, 5],
+        );
+        assert!(derived.read_next_chunk_with_clone().unwrap().is_none());
+    }
 }

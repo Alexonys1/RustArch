@@ -1,9 +1,53 @@
 use std::sync::atomic::{AtomicI64, Ordering};
 
-use colored::Colorize;
+#[cfg(test)]
+use std::sync::{Mutex, MutexGuard};
+
+use owo_colors::OwoColorize;
+
 
 pub const MEMORY_LIMIT_IN_BYTES: i64 = 6 * 1024_i64.pow(3); // 6GB
 pub static MEMORY_BUDGET_IN_BYTES: AtomicI64 = AtomicI64::new(MEMORY_LIMIT_IN_BYTES);
+
+const _: () = assert!(MEMORY_LIMIT_IN_BYTES > 0);
+
+#[cfg(test)]
+static MEMORY_BUDGET_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+
+#[cfg(test)]
+pub(crate) struct TestMemoryBudget {
+    original_budget: i64,
+    _lock: MutexGuard<'static, ()>,
+}
+
+
+#[cfg(test)]
+impl TestMemoryBudget {
+    pub(crate) fn new(available_bytes: i64) -> Self {
+        let lock = MEMORY_BUDGET_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let original_budget = MEMORY_BUDGET_IN_BYTES.swap(available_bytes, Ordering::AcqRel);
+
+        Self {
+            original_budget,
+            _lock: lock,
+        }
+    }
+
+    pub(crate) fn remaining(&self) -> i64 {
+        MEMORY_BUDGET_IN_BYTES.load(Ordering::Acquire)
+    }
+}
+
+
+#[cfg(test)]
+impl Drop for TestMemoryBudget {
+    fn drop(&mut self) {
+        MEMORY_BUDGET_IN_BYTES.store(self.original_budget, Ordering::Release);
+    }
+}
 
 
 // TODO: Его нужно сделать неизменяемым снаружи (interior mutability)?
@@ -97,4 +141,34 @@ pub fn show_memory_bar() {
     println!("{} {}", bar, info);
 
     PREV_FILLED.store(filled, Ordering::Relaxed);
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::{BudgetGuard, TestMemoryBudget};
+
+    #[test]
+    fn budget_guard_reserves_releases_and_returns_memory_on_drop() {
+        let budget = TestMemoryBudget::new(10);
+        let mut guard = BudgetGuard::default();
+
+        assert!(guard.try_grow(6));
+        assert_eq!(budget.remaining(), 4);
+
+        guard.release(2);
+        assert_eq!(budget.remaining(), 6);
+
+        drop(guard);
+        assert_eq!(budget.remaining(), 10);
+    }
+
+    #[test]
+    fn budget_guard_rejects_growth_over_remaining_budget() {
+        let budget = TestMemoryBudget::new(3);
+        let mut guard = BudgetGuard::default();
+
+        assert!(!guard.try_grow(4));
+        assert_eq!(budget.remaining(), 3);
+    }
 }

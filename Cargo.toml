@@ -3,19 +3,22 @@ name = "rustarch"
 version = "0.1.0"
 edition = "2024"
 
-[dependencies]
-colored = "3"
-#mimalloc = "0.1"
-#eframe = "0.28"
-#egui = "0.28"
-#rfd = "0.14"
+[profile.dev]
+opt-level = 1
 
 [profile.release]
-debug = true
 opt-level = 3
 codegen-units = 1 # Бустит скорость больше, чем на 0.5с!!
-lto = true        # Бустит скорость больше, чем на 0.5с!!
+#lto = true
+#debug = true
 
 [profile.samply]
 inherits = "release"
 debug = true
+
+[dependencies]
+owo-colors = "4"
+thiserror = "2"
+
+[target.'cfg(windows)'.dependencies]
+enable-ansi-support = "0"

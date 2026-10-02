@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 use crate::archiver::ArchivedDirectoryEntry;
 use crate::error::AppError;
+use crate::archiver::InputError;
 
 
 #[derive(Debug)]
@@ -102,7 +103,7 @@ fn convert_to_platform_undepended_path(relative_path: &Path) -> String {
 
 fn get_one_file(root: &Path) -> Result<WalkResult, AppError> {
     let file_name = root.file_name().ok_or_else(|| {
-        AppError::CLIUsage(format!("Не удалось определить имя файла из пути '{}'", root.display()))
+        InputError::MissingFileName { path: root.to_path_buf() }
     })?;
 
     Ok(WalkResult {

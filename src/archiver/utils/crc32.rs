@@ -4,6 +4,9 @@ use crate::algorithms::{PipelineSettings, CipherId};
 use crate::archiver::Artifact;
 
 
+const CRC32_IS_ON: bool = false; // TODO: Нужно встроить подсчёт crc32 прямо в алгоритмы!
+
+
 pub struct Crc32 {
     state: u32,
 }
@@ -46,20 +49,15 @@ impl Into<u32> for Crc32 {
 
 /// Если NoCipher, то crc32 всегда равен u32::MAX. Это я сделал для того, чтобы crc32 не считался для файлов без шифрации.
 pub fn crc32_of_artifact_and_rewind(artifact: &mut Artifact, pipeline_settings: PipelineSettings) -> std::io::Result<u32> {
-    if pipeline_settings.cipher == CipherId::NoCipher {
+    if pipeline_settings.cipher == CipherId::NoCipher && !CRC32_IS_ON {
         artifact.rewind_reading();
         return Ok(u32::MAX)  // Просто заглушка
     }
 
     let mut crc32 = Crc32::new();
-    let chunk_size: usize = artifact.chunk_size.get();
-    let mut buffer = vec![0; chunk_size]; // Нужно именно передать заполненный вектор,
-    // а не Vec::with_capacity(chunk_size). Иначе будет запись в неинициализированную память!
 
-    loop {
-        let readed_bytes: usize = artifact.read_chunk_to(&mut buffer)?;
-        if readed_bytes == 0 { break; }
-        crc32.update(&buffer[..readed_bytes]);
+    while let Some(chunk) = artifact.next_chunk()? {
+        crc32.update(&chunk);
     }
 
     artifact.rewind_reading();

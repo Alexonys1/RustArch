@@ -1,8 +1,9 @@
 use crate::error::AppError;
 use crate::archiver::Artifact;
-use super::FecId;
+use crate::algorithms::FecId;
 
-use super::{ErrorCorrectionCode, FecReport};
+use crate::algorithms::fec::{ErrorCorrectionCode, FecReport};
+use super::ReedSolomonError;
 
 
 /// Порождающий многочлен GF(256): x^8 + x^4 + x^3 + x^2 + 1 = 285.
@@ -322,9 +323,7 @@ fn fill_exact(artifact: &mut Artifact, buf: &mut [u8]) -> Result<(), AppError> {
     while filled < buf.len() {
         let read = artifact.read_chunk_to(&mut buf[filled..])?;
         if read == 0 {
-            return Err(AppError::Fec(
-                "Reed-Solomon: неожиданный конец потока при чтении блока".to_string(),
-            ));
+            return Err(ReedSolomonError::UnexpectedEndOfBlock.into());
         }
         filled += read;
     }
@@ -339,7 +338,7 @@ impl ErrorCorrectionCode for ReedSolomonCode {
         let gf = Gf256::new();
         let genz = build_generator(&gf, PARITY_SYMBOLS);
 
-        let mut output = Artifact::new_with_temp_file_suffix(&artifact, "fec_encoded");
+        let mut output = Artifact::new_with_temp_file_suffix(&artifact, "fec_encoded")?;
 
         // Буфер ровно на один блок данных
         let mut data_buf = [0u8; DATA_SYMBOLS];
@@ -388,18 +387,14 @@ impl ErrorCorrectionCode for ReedSolomonCode {
         let shortened_size = encoded_size % CODEWORD_SYMBOLS;
 
         if shortened_size != 0 && shortened_size <= PARITY_SYMBOLS {
-            return Err(AppError::Fec(format!(
-                "Reed-Solomon: некорректная длина потока {encoded_size}: остаток блока {shortened_size} должен быть 0 или {}..={} байт",
-                PARITY_SYMBOLS + 1,
-                CODEWORD_SYMBOLS - 1,
-            )));
+            return Err(ReedSolomonError::InvalidEncodedLength { encoded_size, shortened_size }.into());
         }
 
         let blocks_count = full_blocks + usize::from(shortened_size != 0);
 
         let gf = Gf256::new();
 
-        let mut output = Artifact::new_with_temp_file_suffix(&artifact, "fec_decoded");
+        let mut output = Artifact::new_with_temp_file_suffix(&artifact, "fec_decoded")?;
         let mut report = FecReport::default();
 
         let mut out_buf: Vec<u8> = Vec::with_capacity(OUTPUT_FLUSH_SIZE);
@@ -421,11 +416,10 @@ impl ErrorCorrectionCode for ReedSolomonCode {
                 BlockStatus::Ok => {}
                 BlockStatus::Corrected => report.blocks_corrected += 1,
                 BlockStatus::Uncorrectable => {
-                    return Err(AppError::Fec(format!(
-                        "Reed-Solomon: блок {} из {} содержит неисправимые ошибки",
-                        block_index + 1,
+                    return Err(ReedSolomonError::UncorrectableBlock {
+                        block_number: block_index + 1,
                         blocks_count,
-                    )));
+                    }.into());
                 }
             }
 

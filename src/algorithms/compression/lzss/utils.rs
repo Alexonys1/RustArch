@@ -1,4 +1,4 @@
-use std::io;
+use super::LzssError;
 
 use crate::error::AppError;
 use crate::archiver::Artifact;
@@ -25,14 +25,10 @@ impl SlidingWindow {
         let capacity = window_size
             .checked_add(INPUT_READ_SIZE)
             .and_then(|v| v.checked_add(lookahead_size))
-            .ok_or_else(|| AppError::Compression(
-                "LZSS: Переполнение при вычислении размера скользящего окна".into(),
-            ))?;
+            .ok_or(LzssError::WindowSizeOverflow)?;
         let mut guard = BudgetGuard::default();
         if !guard.try_grow(capacity as i64) {
-            return Err(AppError::Compression(format!(
-                "LZSS: Не удалось зарезервировать {capacity} байт под скользящее окно - бюджет памяти исчерпан"
-            )));
+            return Err(LzssError::WindowMemoryBudgetExceeded { bytes: capacity }.into());
         }
         Ok(Self {
             buffer: Vec::with_capacity(capacity),
@@ -45,7 +41,7 @@ impl SlidingWindow {
     }
 
     /// Выделение памяти и чтение блока файла
-    pub fn ensure_available(&mut self, artifact: &mut Artifact, pos: u64, want: usize) -> io::Result<()> {
+    pub fn ensure_available(&mut self, artifact: &mut Artifact, pos: u64, want: usize) -> Result<(), AppError> {
         if self.available_after(pos) < want && !self.exhausted {
             self.compact_for(pos);
         }
@@ -53,10 +49,7 @@ impl SlidingWindow {
         while !self.exhausted && self.available_after(pos) < want {
             let free = self.capacity.saturating_sub(self.buffer.len());
             if free == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "LZ: Недостаточная ёмкость скользящего окна!",
-                ));
+                return Err(LzssError::InsufficientWindowCapacity.into());
             }
 
             let to_read = free.min(INPUT_READ_SIZE);
@@ -132,9 +125,7 @@ impl HashChain {
         let bytes = (HASH_SIZE + window_size) * std::mem::size_of::<u64>();
         let mut guard = BudgetGuard::default();
         if !guard.try_grow(bytes as i64) {
-            return Err(AppError::Compression(format!(
-                "LZSS: не удалось зарезервировать {bytes} байт под хэш-таблицу - бюджет памяти исчерпан"
-            )));
+            return Err(LzssError::HashTableMemoryBudgetExceeded { bytes }.into());
         }
         Ok(Self {
             head: vec![NONE; HASH_SIZE],
@@ -314,9 +305,7 @@ impl<'a> BufferedArtifactReader<'a> {
 
             let read = self.artifact.read_chunk_to(&mut self.buf[self.end..])?;
             if read == 0 {
-                return Err(AppError::CorruptArchive(
-                    "LZ: неожиданный конец потока при чтении токена".to_string(),
-                ));
+                return Err(LzssError::UnexpectedEndOfToken.into());
             }
             self.end += read;
         }
@@ -394,9 +383,7 @@ impl DecodeHistory {
         out: &mut Vec<u8>,
     ) -> Result<(), AppError> {
         if offset == 0 || offset > self.len {
-            return Err(AppError::CorruptArchive(
-                "LZ: некорректный offset ссылки назад".to_string(),
-            ));
+            return Err(LzssError::InvalidBackReferenceOffset { offset }.into());
         }
 
         out.reserve(length);

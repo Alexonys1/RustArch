@@ -2,9 +2,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, channel};
 
-use colored::Colorize;
+use owo_colors::OwoColorize;
 
 use crate::error::AppError;
+use crate::archiver::{InputError, PipelineError};
 use crate::algorithms::PipelineSettings;
 use crate::archiver::{ArchivedDirectoryEntry, ArchivedArtifactEntry, Artifact, WalkResult, WalkedFile};
 use crate::archiver::{
@@ -50,24 +51,17 @@ pub fn run_command(command: CLICommand) -> Result<(), AppError> {
 
 pub fn run_pack(source_path: &Path, target_archive_path: &Path, settings: PipelineSettings, encode_key: &[u8]) -> Result<(), AppError> {
     if !source_path.exists() {
-        return Err(AppError::CLIUsage(format!(
-            "'{}' не найден!",
-            source_path.display()
-        )));
+        return Err(InputError::SourceNotFound { path: source_path.to_path_buf() }.into());
     }
 
     if same_path(source_path, target_archive_path)? {
-        return Err(AppError::CLIUsage(
-            "Исходный файл и целевой архив не могут быть одним путём".into(),
-        ));
+        return Err(InputError::SameInputAndOutput { input: source_path.to_path_buf(), output: target_archive_path.to_path_buf() }.into());
     }
 
     if source_path.is_dir()
         && canonical_or_absolute(target_archive_path)?.starts_with(fs::canonicalize(source_path)?)
     {
-        return Err(AppError::CLIUsage(
-            "Целевой архив не может находиться внутри исходной директории".into(),
-        ));
+        return Err(InputError::ArchiveInsideSource { archive: target_archive_path.to_path_buf(), directory: source_path.to_path_buf() }.into());
     }
 
     if let Some(parent) = target_archive_path
@@ -87,14 +81,17 @@ pub fn run_pack(source_path: &Path, target_archive_path: &Path, settings: Pipeli
     ) = channel();
 
     let handler_of_artifact_writer = create_thread_with_queue_writer(target_archive_path.to_path_buf(), receiver);
-    pack_files_parallel(target_files, settings, &encode_key, sender)?;
+    let parallel_result = pack_files_parallel(target_files, settings, &encode_key, sender);
 
     // Здесь мы ждём пока все артефакты не будут записаны в архив. Только после этого записываем заголовок:
     let archived_files = handler_of_artifact_writer
         .join()
-        .map_err(|_| AppError::Compression("Поток записи архива аварийно завершился!".into()))??;
+        .map_err(|_| PipelineError::WriterPanicked)??;
 
+    // Лучше проверить сначала отсутствие ошибок у потока, который пишет конечный архив,
+    // а потом проверить другие потоки, потому что они зависят от него.
     write_archive_header(target_archive_path, archived_files, archived_directories)?;
+    parallel_result?;
 
     Ok(())
 }
@@ -102,10 +99,7 @@ pub fn run_pack(source_path: &Path, target_archive_path: &Path, settings: Pipeli
 
 pub fn run_unpack(archive_path: &Path, unpack_path: &Path, decode_key: &[u8]) -> Result<(), AppError> {
     if !archive_path.is_file() {
-        return Err(AppError::CLIUsage(format!(
-            "'{}' не является файлом архива",
-            archive_path.display()
-        )));
+        return Err(InputError::ArchiveNotFile { path: archive_path.to_path_buf() }.into());
     }
 
     let mut archive_file = fs::File::open(archive_path)?;
@@ -122,10 +116,7 @@ pub fn run_unpack(archive_path: &Path, unpack_path: &Path, decode_key: &[u8]) ->
 
 pub fn run_list(archive_path: &Path) -> Result<(), AppError> {
     if !archive_path.is_file() {
-        return Err(AppError::CLIUsage(format!(
-            "'{}' не является файлом архива",
-            archive_path.display()
-        )));
+        return Err(InputError::ArchiveNotFile { path: archive_path.to_path_buf() }.into());
     }
 
     let mut archive_file = fs::File::open(archive_path)?;
@@ -164,26 +155,36 @@ pub fn run_list(archive_path: &Path) -> Result<(), AppError> {
 
     for entry in files {
         let saved_ratio = format_saved_ratio(entry.original_size, entry.stored_size);
-        let kind = format!("{:<4}", "FILE").green().bold();
-        let original = format!("{:>12}", to_human_size(entry.original_size)).cyan();
-        let stored = format!("{:>12}", to_human_size(entry.stored_size)).cyan();
-        let saved_ratio = format!("{:>8}", saved_ratio).cyan();
-        let compression = format!("{:<12}", entry.pipeline.compression.as_str()).yellow();
-        let cipher = format!("{:<8}", entry.pipeline.cipher.as_str()).yellow();
-        let fec = format!("{:<12}", entry.pipeline.fec.as_str()).yellow();
-        let path = entry.relative_path.to_string().cyan();
+        let kind = format!("{:<4}", "FILE").green().bold().to_string();
+        let original = format!("{:>12}", to_human_size(entry.original_size))
+            .cyan()
+            .to_string();
+        let stored = format!("{:>12}", to_human_size(entry.stored_size))
+            .cyan()
+            .to_string();
+        let saved_ratio = format!("{:>8}", saved_ratio).cyan().to_string();
+        let compression = format!("{:<12}", entry.pipeline.compression.as_str())
+            .yellow()
+            .to_string();
+        let cipher = format!("{:<8}", entry.pipeline.cipher.as_str())
+            .yellow()
+            .to_string();
+        let fec = format!("{:<12}", entry.pipeline.fec.as_str())
+            .yellow()
+            .to_string();
+        let path = entry.relative_path.to_string().cyan().to_string();
         println!("{kind} {original} {stored} {saved_ratio} {compression} {cipher} {fec} {path}");
     }
 
     for entry in directories {
-        let kind = format!("{:<4}", "DIR").blue().bold();
-        let original = format!("{:>12}", "-").dimmed();
-        let stored = format!("{:>12}", "-").dimmed();
-        let saved_ratio = format!("{:>8}", "-").dimmed();
-        let compression = format!("{:<12}", "-").dimmed();
-        let cipher = format!("{:<8}", "-").dimmed();
-        let fec = format!("{:<12}", "-").dimmed();
-        let path = entry.relative_path.to_string().cyan();
+        let kind = format!("{:<4}", "DIR").blue().bold().to_string();
+        let original = format!("{:>12}", "-").dimmed().to_string();
+        let stored = format!("{:>12}", "-").dimmed().to_string();
+        let saved_ratio = format!("{:>8}", "-").dimmed().to_string();
+        let compression = format!("{:<12}", "-").dimmed().to_string();
+        let cipher = format!("{:<8}", "-").dimmed().to_string();
+        let fec = format!("{:<12}", "-").dimmed().to_string();
+        let path = entry.relative_path.to_string().cyan().to_string();
         println!("{kind} {original} {stored} {saved_ratio} {compression} {cipher} {fec} {path}");
     }
 

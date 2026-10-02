@@ -1,7 +1,8 @@
 use crate::error::AppError;
 use crate::archiver::{ArchivedArtifactEntry, Artifact};
 use crate::algorithms::compression::{CompressionId, Compressor};
-use crate::algorithms::compression::utils::{
+use super::LzssError;
+use super::utils::{
     BufferedArtifactReader, DecodeHistory, HashChain, SlidingWindow, find_longest_match,
 };
 
@@ -30,7 +31,7 @@ impl Compressor for LzssCompressor {
     }
 
     fn decompress(&self, mut artifact: Artifact, entry: &ArchivedArtifactEntry) -> Result<Artifact, AppError> {
-        let mut output = Artifact::new_with_temp_file_suffix(&artifact, "decompressed");
+        let mut output = Artifact::new_with_temp_file_suffix(&artifact, "decompressed")?;
 
         let mut reader = BufferedArtifactReader::new(&mut artifact);
         let original_size: u64 = entry.original_size;
@@ -60,9 +61,7 @@ impl Compressor for LzssCompressor {
                         // Обработка ПОСЛЕДОВАТЕЛЬНОСТИ токенов
                         let run_len = reader.read_u16_le()? as usize;
                         if run_len == 0 || run_len as u64 > original_size - produced {
-                            return Err(AppError::CorruptArchive(
-                                "LZSS: некорректная длина литерального блока".to_string(),
-                            ));
+                            return Err(LzssError::InvalidLiteralLength { length: run_len }.into());
                         }
                         let start = out_buf.len();
                         reader.append_exact(run_len, &mut out_buf)?;
@@ -73,9 +72,7 @@ impl Compressor for LzssCompressor {
                         let length = reader.read_u8()? as usize + MIN_MATCH_LEN;
 
                         if offset > window.len() || length as u64 > original_size - produced {
-                            return Err(AppError::CorruptArchive(
-                                "LZSS: некорректная ссылка назад".to_string(),
-                            ));
+                            return Err(LzssError::InvalidBackReference { offset, length }.into());
                         }
                         window.copy_match(offset, length, &mut out_buf)?;
                         produced += length as u64;
@@ -113,16 +110,10 @@ impl Compressor for LzssCompressor {
 impl LzssCompressor {
     fn compress_impl(&self, mut artifact: Artifact, allow_passthrough: bool) -> Result<(Artifact, CompressionId), AppError> {
         if WINDOW_SIZE == 0 || WINDOW_SIZE > MAX_OFFSET {
-            return Err(AppError::Compression(format!(
-                "LZSS: window_size={} вне допустимого диапазона 1..={} (формат хранит offset в 2 байтах)",
-                WINDOW_SIZE, MAX_OFFSET
-            )));
+            return Err(LzssError::InvalidWindowSize { size: WINDOW_SIZE, max: MAX_OFFSET }.into());
         }
         if LOOKAHEAD_SIZE == 0 || LOOKAHEAD_SIZE > MAX_LENGTH {
-            return Err(AppError::Compression(format!(
-                "LZSS: lookahead_size={} вне допустимого диапазона 1..={} (формат хранит length - {MIN_MATCH_LEN} в 1 байте)",
-                LOOKAHEAD_SIZE, MAX_LENGTH
-            )));
+            return Err(LzssError::InvalidLookaheadSize { size: LOOKAHEAD_SIZE, max: MAX_LENGTH }.into());
         }
 
         let original_size = artifact.get_payload_size() as u64;
@@ -169,7 +160,7 @@ impl LzssCompressor {
         // ------------------------------------ Конец ранней отсечки ------------------------------------
 
         // Продолжения сжатия с уже отработанного блока
-        let mut output = Artifact::new_with_temp_file_suffix(&artifact, "compressed");
+        let mut output = Artifact::new_with_temp_file_suffix(&artifact, "compressed")?;
         if !out_buf.is_empty() {
             output.write_chunk_from(&out_buf)?;
             out_buf.clear();
@@ -349,10 +340,6 @@ fn compress_step(
     chain.insert(window, pos);
 
     if length >= MIN_MATCH_LEN && length < MAX_LAZY_MATCH_LEN && available > 1 {
-        // ВАЖНАЯ ЭВРИСТИКА
-        // Если текущая подстрока хуже ленивой проверки,
-        // То пробуем увеличить длину за счет смены позиции
-        //TODO: Хрень какая то, разобраться, переделать
         let available_next = window.available_after(pos + 1);
         let max_len_next = LOOKAHEAD_SIZE.min(available_next).min(MAX_LENGTH);
         let (_, length_next) = find_longest_match(

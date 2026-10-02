@@ -78,7 +78,6 @@ fn TEST_2_Huffman_NoCipher_NoFec_pack_and_unpack() { // TODO: Это отлич�
 fn compression_formats_round_trip_without_duplicated_size_headers() {
     for compression in [
         CompressionId::NoCompression,
-        CompressionId::RLE,
         CompressionId::Huffman,
         CompressionId::LZSS,
         CompressionId::Deflate,

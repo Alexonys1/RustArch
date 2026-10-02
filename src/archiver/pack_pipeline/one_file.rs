@@ -3,6 +3,7 @@ use std::sync::mpsc::Sender;
 use crate::algorithms::{Cipher, Compressor, ErrorCorrectionCode, PipelineSettings};
 use crate::archiver::{crc32_of_artifact_and_rewind, ArchivedArtifactEntry, Artifact, Crc32, WalkedFile};
 use crate::error::AppError;
+use crate::archiver::PipelineError;
 
 
 /// compress -> encrypt -> fec-encode
@@ -33,7 +34,7 @@ pub fn pack_file(
 
         artifact_sender
             .send((entry, artifact))
-            .map_err(|_| AppError::Compression("Очередь записи архива недоступна!".into()))?;
+            .map_err(|_| PipelineError::WriterQueueClosed)?;
 
         return Ok(());
     }
@@ -64,7 +65,7 @@ pub fn pack_file(
 
     artifact_sender
         .send((entry, cooked_artifact))
-        .map_err(|_| AppError::Compression("Очередь записи архива недоступна!".into()))?;
+        .map_err(|_| PipelineError::WriterQueueClosed)?;
 
     Ok(())
 }
