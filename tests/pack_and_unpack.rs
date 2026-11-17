@@ -8,7 +8,7 @@ use utils::*;
 use rustarch::cli::{run_pack, run_unpack};
 use rustarch::algorithms::{CipherId, CompressionId, FecId, PipelineSettings};
 use rustarch::archiver::{
-    ArchivedArtifactEntry, read_archive_entries, validate_payload_ranges,
+    ArchivedArtifactEntry, read_archive_header, validate_payload_ranges,
 };
 
 
@@ -147,7 +147,7 @@ fn empty_file_bypasses_the_whole_pipeline() {
     run_pack(&source_file, &archive_path, requested, &[1, 2, 3]).unwrap();
 
     let mut archive = File::open(&archive_path).unwrap();
-    let (entries, directories) = read_archive_entries(&mut archive).unwrap();
+    let (entries, directories) = read_archive_header(&archive_path).unwrap();
     assert!(directories.is_empty());
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].original_size, 0);
@@ -188,7 +188,7 @@ fn mixed_archive_only_bypasses_pipeline_for_empty_files() {
     run_pack(&source_dir, &archive_path, requested, &key).unwrap();
 
     let mut archive = File::open(&archive_path).unwrap();
-    let (entries, _) = read_archive_entries(&mut archive).unwrap();
+    let (entries, _) = read_archive_header(&archive_path).unwrap();
     let empty_entry = entries
         .iter()
         .find(|entry| entry.relative_path.ends_with("empty.bin"))
@@ -296,7 +296,7 @@ fn compression_round_trip(
     run_pack(&source_file, &archive_path, settings, &[]).unwrap();
 
     let mut archive = File::open(&archive_path).unwrap();
-    let (entries, directories) = read_archive_entries(&mut archive).unwrap();
+    let (entries, directories) = read_archive_header(&archive_path).unwrap();
     assert!(directories.is_empty());
     assert_eq!(entries.len(), 1);
     let effective_pipeline = entries[0].pipeline;
@@ -309,4 +309,36 @@ fn compression_round_trip(
     fs::remove_dir_all(root).unwrap();
 
     (effective_pipeline, stored_size, crc32)
+}
+
+#[test]
+fn all_pipeline_combinations_preserve_payload() {
+    let id = TEMP_TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!(
+        "rustarch_pipeline_combinations_{}_{}", std::process::id(), id,
+    ));
+    fs::create_dir_all(&root).unwrap();
+    let source = root.join("payload.bin");
+    let archive = root.join("payload.arch");
+    let output = root.join("unpacked");
+    let key = [1, 2, 3];
+
+    for payload in [vec![0x5A; 4096], (0..4096).map(|i| (i % 251) as u8).collect()] {
+        fs::write(&source, &payload).unwrap();
+        for compression in [CompressionId::NoCompression, CompressionId::Huffman,
+            CompressionId::LZSS, CompressionId::Deflate] {
+            for cipher in [CipherId::NoCipher, CipherId::Xor] {
+                for fec in [FecId::NoFec, FecId::ReedSolomon] {
+                    let settings = PipelineSettings { compression, cipher, fec };
+                    run_pack(&source, &archive, settings, &key).unwrap();
+                    read_archive_header(&archive).unwrap();
+                    run_unpack(&archive, &output, &key).unwrap();
+                    assert_eq!(fs::read(output.join("payload.bin")).unwrap(), payload,
+                        "pipeline: {settings:?}");
+                    fs::remove_dir_all(&output).unwrap();
+                }
+            }
+        }
+    }
+    fs::remove_dir_all(root).unwrap();
 }

@@ -80,6 +80,8 @@ impl Compressor for HuffmanCompressor {
                 remaining -= take as u64;
             }
 
+            output.rewind_cursor();
+
             return Ok(output);
         }
         // ============================ ЧИТАЕМ ЗАГОЛОВОК ФАЙЛА ==========================
@@ -137,6 +139,8 @@ impl Compressor for HuffmanCompressor {
             output.write_chunk_from(&out_buf)?;
         }
 
+        output.rewind_cursor();
+
         Ok(output)
     }
 
@@ -170,7 +174,7 @@ impl HuffmanCompressor {
             }
             original_size += chunk.len() as u64;
         }
-        artifact.rewind_reading();
+        artifact.rewind_cursor();
 
         let nonzero_freqs: Vec<SymbolWithFreq> = freqs
             .into_iter()
@@ -198,6 +202,7 @@ impl HuffmanCompressor {
         if nonzero_freqs.len() == 1 {
             let mut output = Artifact::new_with_temp_file_suffix(&artifact, "compressed")?;
             write_header(&mut output, &nonzero_freqs)?;
+            output.rewind_cursor();
             return Ok((output, CompressionId::Huffman));
         }
         // ======= ЗАЩИТА ОТ МАЛЕНЬКИХ ФАЙЛОВ И ЭВРИСТИКИ ДЛЯ ОТКЛОНЕНИЯ НЕСЖИМАЕМЫХ ФАЙЛОВ ========
@@ -235,6 +240,7 @@ impl HuffmanCompressor {
         }
         writer.finish()?;
 
+        output_artifact.rewind_cursor();
         Ok((output_artifact, CompressionId::Huffman))
     }
 }

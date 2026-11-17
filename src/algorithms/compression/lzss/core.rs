@@ -98,6 +98,8 @@ impl Compressor for LzssCompressor {
             output.write_chunk_from(&out_buf)?;
         }
 
+        output.rewind_cursor();
+
         Ok(output)
     }
 
@@ -154,7 +156,7 @@ impl LzssCompressor {
             && sample_compressed_len as f64 >= sample_len as f64 * INCOMPRESSIBLE_RATIO_THRESHOLD;
 
         if allow_passthrough && incompressible {
-            artifact.rewind_reading();
+            artifact.rewind_cursor();
             return Ok((artifact, CompressionId::NoCompression));
         }
         // ------------------------------------ Конец ранней отсечки ------------------------------------
@@ -189,6 +191,7 @@ impl LzssCompressor {
             output.write_chunk_from(&out_buf)?;
         }
 
+        output.rewind_cursor();
         Ok((output, CompressionId::LZSS))
     }
 }

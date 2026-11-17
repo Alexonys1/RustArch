@@ -50,7 +50,7 @@ impl Into<u32> for Crc32 {
 /// Если NoCipher, то crc32 всегда равен u32::MAX. Это я сделал для того, чтобы crc32 не считался для файлов без шифрации.
 pub fn crc32_of_artifact_and_rewind(artifact: &mut Artifact, pipeline_settings: PipelineSettings) -> std::io::Result<u32> {
     if pipeline_settings.cipher == CipherId::NoCipher && !CRC32_IS_ON {
-        artifact.rewind_reading();
+        artifact.rewind_cursor();
         return Ok(u32::MAX)  // Просто заглушка
     }
 
@@ -60,7 +60,7 @@ pub fn crc32_of_artifact_and_rewind(artifact: &mut Artifact, pipeline_settings: 
         crc32.update(&chunk);
     }
 
-    artifact.rewind_reading();
+    artifact.rewind_cursor();
 
     Ok(crc32.finalize())
 }

@@ -33,10 +33,12 @@ impl Cipher for XorCipher {
                 output.write_chunk_from(&chunk)?;
             }
 
+            output.rewind_cursor();
+
             Ok(output)
         }
         else {
-            artifact.rewind_reading();
+            artifact.rewind_cursor();
             let mut key_pos = 0;
 
             while let Some(chunk) = artifact.next_chunk()? {
@@ -52,7 +54,7 @@ impl Cipher for XorCipher {
                 }
             }
 
-            artifact.rewind_reading();
+            artifact.rewind_cursor();
             Ok(artifact)
         }
     }

@@ -6,6 +6,123 @@ use crate::algorithms::fec::{ErrorCorrectionCode, FecReport};
 use super::ReedSolomonError;
 
 
+pub struct ReedSolomonCode;
+
+impl ErrorCorrectionCode for ReedSolomonCode {
+    fn encode(&self, mut artifact: Artifact) -> Result<Artifact, AppError> {
+        let gf = Gf256::new();
+        let genz = build_generator(&gf, PARITY_SYMBOLS);
+
+        let mut output = Artifact::new_with_temp_file_suffix(&artifact, "fec_encoded")?;
+
+        // Буфер ровно на один блок данных
+        let mut data_buf = [0u8; DATA_SYMBOLS];
+        let mut filled = 0usize;
+        let mut out_buf: Vec<u8> = Vec::with_capacity(OUTPUT_FLUSH_SIZE);
+
+        while let Some(chunk) = artifact.next_chunk()? {
+            let mut chunk_pos = 0;
+            while chunk_pos < chunk.len() {
+                let take = (DATA_SYMBOLS - filled).min(chunk.len() - chunk_pos);
+                data_buf[filled..filled + take].copy_from_slice(&chunk[chunk_pos..chunk_pos + take]);
+                filled += take;
+                chunk_pos += take;
+
+                // Проверка на остаток файла
+                if filled == DATA_SYMBOLS {
+                    let codeword = rs_encode_block(&gf, &data_buf, &genz);
+                    out_buf.extend_from_slice(&codeword);
+                    filled = 0;
+
+                    if out_buf.len() >= OUTPUT_FLUSH_SIZE {
+                        output.write_chunk_from(&out_buf)?;
+                        out_buf.clear();
+                    }
+                }
+            }
+        }
+
+        if filled > 0 {
+            // Дополняем укороченный RS-блок
+            let codeword = rs_encode_block(&gf, &data_buf[..filled], &genz);
+            out_buf.extend_from_slice(&codeword);
+        }
+
+        // Принудительный сброс буфера
+        if !out_buf.is_empty() {
+            output.write_chunk_from(&out_buf)?;
+        }
+
+        output.rewind_cursor();
+
+        Ok(output)
+    }
+
+    fn decode(&self, mut artifact: Artifact) -> Result<(Artifact, FecReport), AppError> {
+        let encoded_size = artifact.get_payload_size();
+        let full_blocks = encoded_size / CODEWORD_SYMBOLS;
+        let shortened_size = encoded_size % CODEWORD_SYMBOLS;
+
+        if shortened_size != 0 && shortened_size <= PARITY_SYMBOLS {
+            return Err(ReedSolomonError::InvalidEncodedLength { encoded_size, shortened_size }.into());
+        }
+
+        let blocks_count = full_blocks + usize::from(shortened_size != 0);
+
+        let gf = Gf256::new();
+
+        let mut output = Artifact::new_with_temp_file_suffix(&artifact, "fec_decoded")?;
+        let mut report = FecReport::default();
+
+        let mut out_buf: Vec<u8> = Vec::with_capacity(OUTPUT_FLUSH_SIZE);
+        let mut block_buf = vec![0u8; CODEWORD_SYMBOLS];
+
+        for block_index in 0..blocks_count {
+            let block_size = if block_index < full_blocks {
+                CODEWORD_SYMBOLS
+            } else {
+                shortened_size
+            };
+            let data_size = block_size - PARITY_SYMBOLS;
+            block_buf.resize(block_size, 0);
+            fill_exact(&mut artifact, &mut block_buf)?;
+
+            let status = decode_block(&gf, &mut block_buf, PARITY_SYMBOLS);
+            report.blocks_processed += 1;
+            
+            match status {
+                BlockStatus::Ok => {}
+                BlockStatus::Corrected => report.blocks_corrected += 1,
+                BlockStatus::Uncorrectable => {
+                    return Err(ReedSolomonError::UncorrectableBlock {
+                        block_number: block_index + 1,
+                        blocks_count,
+                    }.into());
+                }
+            }
+
+            out_buf.extend_from_slice(&block_buf[..data_size]);
+
+            if out_buf.len() >= OUTPUT_FLUSH_SIZE {
+                output.write_chunk_from(&out_buf)?;
+                out_buf.clear();
+            }
+        }
+
+        if !out_buf.is_empty() {
+            output.write_chunk_from(&out_buf)?;
+        }
+
+        output.rewind_cursor();
+        Ok((output, report))
+    }
+
+    fn id(&self) -> FecId {
+        FecId::ReedSolomon
+    }
+}
+
+
 /// Порождающий многочлен GF(256): x^8 + x^4 + x^3 + x^2 + 1 = 285.
 const GF_GENERATOR_POLY: u16 = 0x11D;
 
@@ -328,117 +445,4 @@ fn fill_exact(artifact: &mut Artifact, buf: &mut [u8]) -> Result<(), AppError> {
         filled += read;
     }
     Ok(())
-}
-
-
-pub struct ReedSolomonCode;
-
-impl ErrorCorrectionCode for ReedSolomonCode {
-    fn encode(&self, mut artifact: Artifact) -> Result<Artifact, AppError> {
-        let gf = Gf256::new();
-        let genz = build_generator(&gf, PARITY_SYMBOLS);
-
-        let mut output = Artifact::new_with_temp_file_suffix(&artifact, "fec_encoded")?;
-
-        // Буфер ровно на один блок данных
-        let mut data_buf = [0u8; DATA_SYMBOLS];
-        let mut filled = 0usize;
-        let mut out_buf: Vec<u8> = Vec::with_capacity(OUTPUT_FLUSH_SIZE);
-
-        while let Some(chunk) = artifact.next_chunk()? {
-            let mut chunk_pos = 0;
-            while chunk_pos < chunk.len() {
-                let take = (DATA_SYMBOLS - filled).min(chunk.len() - chunk_pos);
-                data_buf[filled..filled + take].copy_from_slice(&chunk[chunk_pos..chunk_pos + take]);
-                filled += take;
-                chunk_pos += take;
-
-                // Проверка на остаток файла
-                if filled == DATA_SYMBOLS {
-                    let codeword = rs_encode_block(&gf, &data_buf, &genz);
-                    out_buf.extend_from_slice(&codeword);
-                    filled = 0;
-
-                    if out_buf.len() >= OUTPUT_FLUSH_SIZE {
-                        output.write_chunk_from(&out_buf)?;
-                        out_buf.clear();
-                    }
-                }
-            }
-        }
-
-        if filled > 0 {
-            // Дополняем укороченный RS-блок
-            let codeword = rs_encode_block(&gf, &data_buf[..filled], &genz);
-            out_buf.extend_from_slice(&codeword);
-        }
-
-        // Принудительный сброс буфера
-        if !out_buf.is_empty() {
-            output.write_chunk_from(&out_buf)?;
-        }
-
-        Ok(output)
-    }
-
-    fn decode(&self, mut artifact: Artifact) -> Result<(Artifact, FecReport), AppError> {
-        let encoded_size = artifact.get_payload_size();
-        let full_blocks = encoded_size / CODEWORD_SYMBOLS;
-        let shortened_size = encoded_size % CODEWORD_SYMBOLS;
-
-        if shortened_size != 0 && shortened_size <= PARITY_SYMBOLS {
-            return Err(ReedSolomonError::InvalidEncodedLength { encoded_size, shortened_size }.into());
-        }
-
-        let blocks_count = full_blocks + usize::from(shortened_size != 0);
-
-        let gf = Gf256::new();
-
-        let mut output = Artifact::new_with_temp_file_suffix(&artifact, "fec_decoded")?;
-        let mut report = FecReport::default();
-
-        let mut out_buf: Vec<u8> = Vec::with_capacity(OUTPUT_FLUSH_SIZE);
-        let mut block_buf = vec![0u8; CODEWORD_SYMBOLS];
-
-        for block_index in 0..blocks_count {
-            let block_size = if block_index < full_blocks {
-                CODEWORD_SYMBOLS
-            } else {
-                shortened_size
-            };
-            let data_size = block_size - PARITY_SYMBOLS;
-            block_buf.resize(block_size, 0);
-            fill_exact(&mut artifact, &mut block_buf)?;
-
-            let status = decode_block(&gf, &mut block_buf, PARITY_SYMBOLS);
-            report.blocks_processed += 1;
-            match status {
-                BlockStatus::Ok => {}
-                BlockStatus::Corrected => report.blocks_corrected += 1,
-                BlockStatus::Uncorrectable => {
-                    return Err(ReedSolomonError::UncorrectableBlock {
-                        block_number: block_index + 1,
-                        blocks_count,
-                    }.into());
-                }
-            }
-
-            out_buf.extend_from_slice(&block_buf[..data_size]);
-
-            if out_buf.len() >= OUTPUT_FLUSH_SIZE {
-                output.write_chunk_from(&out_buf)?;
-                out_buf.clear();
-            }
-        }
-
-        if !out_buf.is_empty() {
-            output.write_chunk_from(&out_buf)?;
-        }
-
-        Ok((output, report))
-    }
-
-    fn id(&self) -> FecId {
-        FecId::ReedSolomon
-    }
 }

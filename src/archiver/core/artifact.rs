@@ -1,6 +1,6 @@
 use std::io::{self, Read, Write, Seek, SeekFrom};
 use std::fs::{self, File, OpenOptions};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::sync::atomic::Ordering;
 use std::path::{Path, PathBuf};
 use std::collections::HashMap;
@@ -22,14 +22,13 @@ pub struct Artifact {
     state: ArtifactState,
     file_path: PathBuf,
     is_temp_file: bool,
-    reading_position: usize,
-    writing_position: usize,
+    cursor: usize,
 }
 
 
 enum ArtifactState {
     File { file: File, size: usize },
-    Memory { data: Vec<u8>, budget_guard: BudgetGuard },
+    Memory { data: Vec<u8>, budget_guard: Option<BudgetGuard> },
     FileWindow { file: File, base_offset: u64, len: u64 },
 }
 
@@ -47,8 +46,7 @@ impl Artifact {
             chunk_size: NonZeroUsize::new(DEFAULT_CHUNK_SIZE_IN_BYTES).unwrap(),
             file_path: path.to_path_buf(),
             is_temp_file: false, // Файл мы удалять не будем, т.к. он не временный
-            reading_position: 0,
-            writing_position: 0,
+            cursor: 0,
         })
     }
 
@@ -61,8 +59,7 @@ impl Artifact {
             chunk_size: NonZeroUsize::new(DEFAULT_CHUNK_SIZE_IN_BYTES).unwrap(),
             file_path: path.to_path_buf(),
             is_temp_file: false,
-            reading_position: 0,
-            writing_position: 0,
+            cursor: 0,
         })
     }
 
@@ -82,8 +79,7 @@ impl Artifact {
                     size: 0,
                 },
                 chunk_size: artifact.chunk_size,
-                reading_position: 0,
-                writing_position: 0,
+                cursor: 0,
                 file_path,
             })
         }
@@ -92,10 +88,21 @@ impl Artifact {
                 chunk_size: artifact.chunk_size,
                 file_path: make_numbered_temp_file_path(artifact.file_path.as_ref(), suffix),
                 is_temp_file: true,
-                state: ArtifactState::Memory { data: Vec::new(), budget_guard: BudgetGuard::default() },
-                reading_position: 0,
-                writing_position: 0,
+                state: ArtifactState::Memory { data: Vec::new(), budget_guard: Some(BudgetGuard::default()) },
+                cursor: 0,
             })
+        }
+    }
+
+    /// Создаёт артефакт, который лежит *только* в оперативной памяти. Он не может быть сброшен на диск.
+    /// И он не участвует в подсчёте бюджета памяти.
+    pub fn new_small() -> Artifact {
+        Artifact {
+            chunk_size: NonZeroUsize::new(DEFAULT_CHUNK_SIZE_IN_BYTES).unwrap(),
+            state: ArtifactState::Memory { data: vec![], budget_guard: None },
+            file_path: "ONLY_MEMORY".into(),
+            is_temp_file: false, // Файла в любом случае не будет. См. деструктор
+            cursor: 0,
         }
     }
 
@@ -130,19 +137,48 @@ impl Artifact {
         Ok(())
     }
 
+    /// Преобразует Artifact в Vec<u8>. Внутренние курсоры cursor, writing_position
+    /// не учитываются и чтение начинается с начала файла или памяти.
+    /// Учитывается только курсор для файлового окна.
+    pub fn into_vec(mut self) -> io::Result<Vec<u8>> {
+        match &mut self.state {
+            ArtifactState::File { file, size } => {
+                let mut data = vec![0; *size];
+
+                file.seek(SeekFrom::Start(0))?;
+                file.read_exact(&mut data)?;
+
+                Ok(data)
+            }
+
+            ArtifactState::Memory { data, .. } => Ok(std::mem::take(data)),
+
+            ArtifactState::FileWindow { file, base_offset, len } => {
+                let size = *len as usize;
+                let mut data = vec![0; size];
+
+                file.seek(SeekFrom::Start(*base_offset))?;
+                file.read_exact(&mut data)?;
+
+                Ok(data)
+            }
+        }
+    }
+
     pub fn write_to_file_end(&mut self, sink: &mut File) -> io::Result<()> {
         while let Some(chunk) = self.next_chunk()? {
             sink.write_all(&chunk)?;
         }
 
         sink.flush()?;
+
         Ok(())
     }
 
     /// Возвращает кол-во хранящихся байт без учёта положения курсора чтения/записи.
     pub fn get_payload_size(&self) -> usize {
         match &self.state {
-            ArtifactState::File     { size, .. } => *size,
+            ArtifactState::File      { size, .. } => *size,
             ArtifactState::Memory { data, .. } => data.len(),
             ArtifactState::FileWindow  { len, .. } => *len as usize,
         }
@@ -168,9 +204,9 @@ impl Artifact {
             ArtifactState::File { .. } => Ok(None),
             
             ArtifactState::Memory { data, .. } => {
-                let to_read_bytes = data.len().saturating_sub(self.reading_position);
-                let result = Ok(Some(&mut data[self.reading_position..self.reading_position + to_read_bytes]));
-                self.reading_position += to_read_bytes;
+                let to_read_bytes = data.len().saturating_sub(self.cursor);
+                let result = Ok(Some(&mut data[self.cursor..self.cursor + to_read_bytes]));
+                self.cursor += to_read_bytes;
                 result
             }
             
@@ -183,7 +219,7 @@ impl Artifact {
     pub fn next_chunk(&mut self) -> io::Result<Option<Cow<'_, [u8]>>> {
         match &mut self.state {
             ArtifactState::File { file, .. } => {
-                file.seek(SeekFrom::Start(self.reading_position as u64))?;
+                file.seek(SeekFrom::Start(self.cursor as u64))?;
                 let mut buffer = vec![0; self.chunk_size.get()];
                 let n = file.read(&mut buffer)?;
 
@@ -191,32 +227,32 @@ impl Artifact {
                     return Ok(None);
                 }
 
-                self.reading_position += n;
+                self.cursor += n;
                 buffer.truncate(n);
 
                 Ok(Some(Cow::Owned(buffer)))
             }
 
             ArtifactState::Memory { data, .. } => {
-                if self.reading_position >= data.len() {
+                if self.cursor >= data.len() {
                     return Ok(None);
                 }
-                let start = self.reading_position;
+                let start = self.cursor;
                 let end = (start + self.chunk_size.get()).min(data.len());
-                self.reading_position = end;
+                self.cursor = end;
 
                 Ok(Some(Cow::Borrowed(&data[start..end])))
             }
 
             ArtifactState::FileWindow { file, base_offset, len } => {
-                let remaining = (*len).saturating_sub(self.reading_position as u64);
+                let remaining = (*len).saturating_sub(self.cursor as u64);
 
                 if remaining == 0 {
                     return Ok(None);
                 }
 
                 let want = remaining.min(self.chunk_size.get() as u64) as usize;
-                file.seek(SeekFrom::Start(*base_offset + self.reading_position as u64))?;
+                file.seek(SeekFrom::Start(*base_offset + self.cursor as u64))?;
                 let mut buffer = vec![0; want];
                 let n = file.read(&mut buffer)?;
 
@@ -224,7 +260,7 @@ impl Artifact {
                     return Ok(None);
                 }
 
-                self.reading_position += n;
+                self.cursor += n;
                 buffer.truncate(n);
 
                 Ok(Some(Cow::Owned(buffer)))
@@ -240,7 +276,7 @@ impl Artifact {
 
         match &mut self.state {
             ArtifactState::File { file, .. } => {
-                file.seek(SeekFrom::Start(self.reading_position as u64))?; // TODO: А нужно ли?
+                file.seek(SeekFrom::Start(self.cursor as u64))?; // TODO: А нужно ли?
 
                 let mut filled = 0;
                 while filled < actual_buf.len() {
@@ -249,27 +285,27 @@ impl Artifact {
                     filled += n;
                 }
 
-                self.reading_position += filled;
+                self.cursor += filled;
                 Ok(filled)
             }
             
             ArtifactState::Memory { data, .. } => {
-                let remaining_of_bytes = data.len().saturating_sub(self.reading_position);
+                let remaining_of_bytes = data.len().saturating_sub(self.cursor);
                 let to_read_bytes = remaining_of_bytes.min(max_to_read);
                 actual_buf[..to_read_bytes]
-                    .copy_from_slice(&data[self.reading_position..self.reading_position + to_read_bytes]);
-                self.reading_position += to_read_bytes;
+                    .copy_from_slice(&data[self.cursor..self.cursor + to_read_bytes]);
+                self.cursor += to_read_bytes;
                 Ok(to_read_bytes)
             }
             
             ArtifactState::FileWindow { file, base_offset, len } => {
-                let remaining = (*len).saturating_sub(self.reading_position as u64);
+                let remaining = (*len).saturating_sub(self.cursor as u64);
                 let to_read = (remaining as usize).min(max_to_read);
                 if to_read == 0 {
                     return Ok(0);
                 }
 
-                file.seek(SeekFrom::Start(*base_offset + self.reading_position as u64))?;
+                file.seek(SeekFrom::Start(*base_offset + self.cursor as u64))?;
 
                 let mut filled = 0;
                 while filled < to_read {
@@ -278,7 +314,7 @@ impl Artifact {
                     filled += n;
                 }
 
-                self.reading_position += filled;
+                self.cursor += filled;
                 Ok(filled)
             }
         }
@@ -318,16 +354,12 @@ impl Artifact {
         Ok(())
     }
 
-    pub fn set_reading_position(&mut self, pos: usize) {
-        self.reading_position = pos;
+    pub fn set_cursor(&mut self, pos: usize) {
+        self.cursor = pos;
     }
 
-    pub fn set_writing_position(&mut self, pos: usize) {
-        self.writing_position = pos;
-    }
-
-    pub fn rewind_reading(&mut self) {
-        self.reading_position = 0;
+    pub fn rewind_cursor(&mut self) {
+        self.cursor = 0;
     }
 
     /// Скопирует данные артефакта в Writable.
@@ -392,25 +424,29 @@ impl Artifact {
 
         match &mut self.state {
             ArtifactState::File { file, size } => {
-                file.seek(SeekFrom::Start(self.writing_position as u64))?;
+                file.seek(SeekFrom::Start(self.cursor as u64))?;
                 let written_bytes = file.write(actual_buf)?;
-                self.writing_position += written_bytes;
+                self.cursor += written_bytes;
 
-                let new_end = self.writing_position;
+                let new_end = self.cursor;
                 if new_end > *size {
                     *size = new_end;
                     file.set_len(new_end as u64)?;
                 }
                 Ok(written_bytes)
             }
-            ArtifactState::Memory { data, budget_guard } => {
-                let new_len = self.writing_position + max_to_write;
+
+            ArtifactState::Memory { data, budget_guard: maybe_budget_guard } => {
+                let new_len = self.cursor + max_to_write;
 
                 if new_len > data.len() {
                     let additional_bytes: i64 = new_len as i64 - data.len() as i64;
 
-                    if budget_guard.try_grow(additional_bytes) {
-                        data.resize(new_len, 0);
+                    if maybe_budget_guard
+                        .as_mut()
+                        .is_none_or(|guard| guard.try_grow(additional_bytes))
+                    {
+                        data.resize(new_len, 0); // Расширим вектор нулями
                     } else {
                         // Не хватило бюджета памяти - сбрасываем накопленные
                         // данные на диск и продолжаем запись уже туда:
@@ -431,12 +467,13 @@ impl Artifact {
                     }
                 }
 
-                let end = self.writing_position + max_to_write;
-                data[self.writing_position..end].copy_from_slice(actual_buf);
-                self.writing_position += max_to_write;
+                let end = self.cursor + max_to_write;
+                data[self.cursor..end].copy_from_slice(actual_buf);
+                self.cursor += max_to_write;
 
                 Ok(max_to_write)
             }
+
             ArtifactState::FileWindow { .. } => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "Artifact::FileWindow доступен только для чтения!",
@@ -452,7 +489,7 @@ impl Drop for Artifact {
             ArtifactState::File { .. } => {
                 if self.is_temp_file {
                     let path: &Path = self.file_path.as_ref();
-                    let _result: io::Result<()> = fs::remove_file(path);
+                    let _: io::Result<()> = fs::remove_file(path);
                     //println!("The artifact [FILE] has been removed: {:?}. Path: {:?}", result, self.file_path);
                 } else {
                     //println!("The artifact [FILE] has been dropped, but the file is still exists. Path: {:?}", self.file_path);
@@ -472,16 +509,121 @@ impl Drop for Artifact {
 }
 
 
+impl Write for Artifact {
+    fn write(&mut self, source: &[u8]) -> io::Result<usize> {
+        if source.is_empty() {
+            return Ok(0);
+        }
+
+        self.write_chunk_once_from(source)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match &mut self.state {
+            ArtifactState::File { file, .. } => file.flush(),
+            ArtifactState::Memory { .. } | ArtifactState::FileWindow { .. } => Ok(()),
+        }
+    }
+}
+
+
+impl Read for Artifact {
+    fn read(&mut self, dest: &mut [u8]) -> io::Result<usize> {
+        let limit = dest
+            .len()
+            .min(self.chunk_size.get())
+            .min(usize::MAX - self.cursor);
+
+        if limit == 0 {
+            return Ok(0);
+        }
+
+        let dest: &mut [u8] = &mut dest[..limit];
+
+        let read_bytes: usize = match &mut self.state {
+            ArtifactState::File { file, .. } => {
+                file.seek(SeekFrom::Start(self.cursor as u64))?;
+                file.read(dest)?
+            }
+
+            ArtifactState::Memory { data, .. } => {
+                if self.cursor >= data.len() {
+                    return Ok(0);
+                }
+
+                let count = dest.len().min(data.len() - self.cursor);
+                dest[..count].copy_from_slice(
+                    &data[self.cursor..self.cursor + count],
+                );
+                count
+            }
+
+            ArtifactState::FileWindow { file, base_offset, len } => {
+                let remaining = len.saturating_sub(self.cursor as u64);
+                let count = remaining.min(dest.len() as u64) as usize;
+
+                if count == 0 {
+                    return Ok(0);
+                }
+
+                let offset = base_offset
+                    .checked_add(self.cursor as u64)
+                    .ok_or(io::ErrorKind::InvalidInput)?;
+
+                file.seek(SeekFrom::Start(offset))?;
+                file.read(&mut dest[..count])?
+            }
+        };
+
+        self.cursor += read_bytes;
+        Ok(read_bytes)
+    }
+}
+
+
+impl Seek for Artifact {
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        let position: u64 = match position {
+            SeekFrom::Start(offset) => offset,
+
+            SeekFrom::Current(offset) => (self.cursor as u64)
+                .checked_add_signed(offset)
+                .ok_or(io::ErrorKind::InvalidInput)?,
+
+            SeekFrom::End(offset) => {
+                let len = match &self.state {
+                    ArtifactState::File { file, .. } => file.metadata()?.len(),
+                    ArtifactState::Memory { data, .. } => data.len() as u64,
+                    ArtifactState::FileWindow { len, .. } => *len,
+                };
+
+                len.checked_add_signed(offset)
+                    .ok_or(io::ErrorKind::InvalidInput)?
+            }
+        };
+
+        self.cursor = usize::try_from(position)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+
+        Ok(position)
+    }
+
+    fn stream_position(&mut self) -> io::Result<u64> {
+        Ok(self.cursor as u64)
+    }
+}
+
+
 fn make_numbered_temp_file_path(old_path: &Path, suffix: &str) -> PathBuf {
     static NUM_MAP: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
 
-    let filename = old_path
+    let filename: String = old_path
         .file_stem()
         .expect("Нельзя извлечь основу имени файла (stem)!")
         .to_string_lossy()
         .to_string();
 
-    let mut map = NUM_MAP
+    let mut map: MutexGuard<HashMap<PathBuf, usize>> = NUM_MAP
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .expect("Мьютекс отравлен!");
@@ -548,7 +690,7 @@ mod tests {
         assert_eq!(budget.remaining(), 2);
 
         derived.write_chunk_from(&[4, 5, 6]).unwrap();
-        derived.rewind_reading();
+        derived.rewind_cursor();
 
         assert_eq!(derived.get_payload_size(), 3);
         assert_eq!(derived.read_next_chunk_with_clone().unwrap().unwrap(), [4, 5, 6]);
@@ -571,7 +713,7 @@ mod tests {
         assert!(derived.on_disk());
         assert_eq!(budget.remaining(), 4);
 
-        derived.rewind_reading();
+        derived.rewind_cursor();
         assert_eq!(derived.get_payload_size(), 5);
         assert_eq!(
             derived.read_next_chunk_with_clone().unwrap().unwrap(),

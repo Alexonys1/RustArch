@@ -24,9 +24,9 @@ const QUICK_SETTINGS: PipelineSettings = PipelineSettings {
 };
 
 
-const QUICK_RUN_MODE: QuickRunMode = QuickRunMode::Pack; // <==============================
+const QUICK_RUN_MODE: QuickRunMode = QuickRunMode::Release; // Лучше пользоваться скриптами в config.toml, чтобы не перекомпилировать весь проект
 const QUICK_SOURCE_PATH: &str = r"C:\Games\Battlefield 2142 Novgames RST";
-const QUICK_ARCHIVE_PATH: &str = r".\battlefield.arch";
+const QUICK_ARCHIVE_PATH: &str = r".\test_data_for_removing\battlefield.arch";
 const QUICK_UNPACK_PATH: &str = r".\test_data_for_removing\unpacked";
 const QUICK_WORKERS_FOR_GROUPING: usize = 16;
 

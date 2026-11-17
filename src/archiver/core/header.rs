@@ -2,23 +2,11 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Write, Seek, SeekFrom};
 use std::path::Path;
 
-use crate::algorithms::PipelineSettings;
+use crate::algorithms::fec::ReedSolomonCode;
+use crate::algorithms::{ErrorCorrectionCode, PipelineSettings};
 use crate::error::AppError;
-use crate::archiver::ArchiveError;
+use crate::archiver::{ArchiveError, Artifact};
 
-
-pub const MAGIC: [u8; 4] = *b"RARC";
-pub const FORMAT_VERSION: u16 = 3;
-pub const FOOTER_SIZE: u64 = 32;
-
-
-#[derive(Debug, Clone, Copy)]
-pub struct ArchiveFooter {
-    pub table_offset: u64,
-    pub table_size: u64,
-    pub file_count: u32,
-    pub directory_count: u32,
-}
 
 #[derive(Debug, Clone)]
 pub struct ArchivedArtifactEntry {
@@ -36,81 +24,128 @@ pub struct ArchivedDirectoryEntry {
 }
 
 
+const MAGIC: [u8; 4] = *b"RARC";
+const FORMAT_VERSION: u16 = 4;
+const FOOTER_DATA_SIZE: u64 = 32;
+const FOOTER_SIZE: u64 = 64; // Данные 32 байта + Добавочные данные Рида-Соломона 32 байта
+
+
+#[derive(Debug, Clone, Copy)]
+struct ArchiveFooter {
+    table_start: u64,
+    table_size: u64,
+    file_count: u32,
+    directory_count: u32,
+}
+
+
 pub fn write_archive_header(
     target_archive_path: &Path,
     archived_files: Vec<ArchivedArtifactEntry>,
     archived_directories: Vec<ArchivedDirectoryEntry>,
 ) -> Result<(), AppError>
 {
-    let mut archive_file = OpenOptions::new()
+    let mut archive_file: File = OpenOptions::new()
         .read(true)
         .write(true)
         .open(target_archive_path)?;
-    let table_offset = archive_file.metadata()?.len();
 
-    validate_payload_ranges(&archived_files, table_offset)?;
-    archive_file.seek(SeekFrom::Start(table_offset))?;
+    let table_start: u64 = archive_file.metadata()?.len(); // Начало таблицы там, где конец данных. Данные уже записаны в определённом порядке.
+    archive_file.seek(SeekFrom::Start(table_start))?;
+
+    let mut table: Artifact = Artifact::new_small();
 
     // Запишем сначала файлы, а потом пустые папки:
     for entry in archived_files.iter() {
-        entry.write_to(&mut archive_file)?;
-    }
-    
-    for entry in archived_directories.iter() {
-        entry.write_to(&mut archive_file)?;
+        entry.write_to(&mut table)?;
     }
 
-    let table_end: u64 = archive_file.stream_position()?;
-    let table_size: u64 = table_end
-        .checked_sub(table_offset)
-        .ok_or_else(|| AppError::from(ArchiveError::InvalidTableSize))?;
+    for entry in archived_directories.iter() {
+        entry.write_to(&mut table)?;
+    }
+
+    table.rewind_cursor();
+    let mut protected_table: Artifact = ReedSolomonCode.encode(table)?;
+    protected_table.rewind_cursor();
+    let table_size: u64 = protected_table.get_payload_size() as u64;
+
     let file_count: u32 = u32::try_from(archived_files.len())
         .map_err(|_| AppError::from(ArchiveError::TooManyFiles { count: archived_files.len() }))?;
     let directory_count: u32 = u32::try_from(archived_directories.len())
         .map_err(|_| AppError::from(ArchiveError::TooManyDirectories { count: archived_directories.len() }))?;
 
+    let mut footer: Artifact = Artifact::new_small();
     ArchiveFooter {
-        table_offset,
+        table_start,
         table_size,
         file_count,
         directory_count,
-    }.write_to(&mut archive_file)?;
-    
+    }.write_to(&mut footer)?;
+
+    footer.rewind_cursor();
+    let mut protected_footer: Artifact = ReedSolomonCode.encode(footer)?;
+    protected_footer.rewind_cursor();
+
+    protected_table.write_to_file_end(&mut archive_file)?;
+    protected_footer.write_to_file_end(&mut archive_file)?;
+
     archive_file.sync_all()?;
-    
+
     Ok(())
 }
 
 
-pub fn read_archive_entries(file: &mut File) -> Result<(Vec<ArchivedArtifactEntry>, Vec<ArchivedDirectoryEntry>), AppError> {
-    let footer = ArchiveFooter::read_from(file)?;
-    let table_end: u64 = footer.table_end()?;
+pub fn read_archive_header(archive_path: &Path) -> Result<(Vec<ArchivedArtifactEntry>, Vec<ArchivedDirectoryEntry>), AppError> {
+    let archive_file = File::open(archive_path)?;
 
-    file.seek(SeekFrom::Start(footer.table_offset))?;
+    let start_of_protected_footer = archive_file
+        .metadata()?
+        .len()
+        .checked_sub(FOOTER_SIZE)
+        .ok_or_else(|| AppError::from(ArchiveError::ArchiveTooShort))?;
 
-    let file_capacity: usize = usize::try_from(footer.file_count)
-        .map_err(|_| AppError::from(ArchiveError::FileCountExceedsPlatformLimit { count: footer.file_count }))?;
-    let directory_capacity = usize::try_from(footer.directory_count)
-        .map_err(|_| AppError::from(ArchiveError::DirectoryCountExceedsPlatformLimit { count: footer.directory_count }))?;
+    let protected_footer: Artifact = Artifact::from_file_range(archive_path, start_of_protected_footer, FOOTER_SIZE)?;
+
+    let (mut footer, _): (Artifact, _) = ReedSolomonCode.decode(protected_footer)?;
+    footer.rewind_cursor();
+
+    let footer: ArchiveFooter = ArchiveFooter::from_artifact_footer(footer)?;
+
+    if footer.table_end()? != start_of_protected_footer {
+        return Err(ArchiveError::InvalidTableBounds.into());
+    }
+
+    let protected_table: Artifact = Artifact::from_file_range(
+        archive_path,
+        footer.table_start,
+        footer.table_size,
+    )?;
+
+    let (mut table, _): (Artifact, _) = ReedSolomonCode.decode(protected_table)?;
+    table.rewind_cursor();
+
+    let table_end = table.get_payload_size() as u64;
+    let file_capacity = footer.file_count as usize;
+    let directory_capacity = footer.directory_count as usize;
 
     let mut files: Vec<ArchivedArtifactEntry> = Vec::with_capacity(file_capacity);
     for _ in 0..footer.file_count {
-        files.push(ArchivedArtifactEntry::read_from(file)?);
-        ensure_inside_table(file, table_end)?;
+        files.push(ArchivedArtifactEntry::read_from(&mut table)?);
+        ensure_inside_table(&mut table, table_end)?;
     }
 
     let mut directories: Vec<ArchivedDirectoryEntry> = Vec::with_capacity(directory_capacity);
     for _ in 0..footer.directory_count {
-        directories.push(ArchivedDirectoryEntry::read_from(file)?);
-        ensure_inside_table(file, table_end)?;
+        directories.push(ArchivedDirectoryEntry::read_from(&mut table)?);
+        ensure_inside_table(&mut table, table_end)?;
     }
 
-    if file.stream_position()? != table_end {
-        return Err(AppError::from(ArchiveError::TableSizeMismatch));
+    if table.stream_position()? != table_end {
+        return Err(ArchiveError::TableSizeMismatch.into());
     }
 
-    validate_payload_ranges(&files, footer.table_offset)?;
-    
+    validate_payload_ranges(&files, footer.table_start)?;
+
     Ok((files, directories))
 }
 
@@ -165,57 +200,53 @@ impl ArchivedDirectoryEntry {
 
 
 impl ArchiveFooter {
-    pub fn write_to(self, file: &mut File) -> Result<(), AppError> {
+    pub fn write_to<Writable: Write + ?Sized>(self, file: &mut Writable) -> Result<(), AppError> {
         file.write_all(&MAGIC)?;
         file.write_all(&FORMAT_VERSION.to_le_bytes())?;
         file.write_all(&0u16.to_le_bytes())?;
-        file.write_all(&self.table_offset.to_le_bytes())?;
+        file.write_all(&self.table_start.to_le_bytes())?;
         file.write_all(&self.table_size.to_le_bytes())?;
         file.write_all(&self.file_count.to_le_bytes())?;
         file.write_all(&self.directory_count.to_le_bytes())?;
         Ok(())
     }
 
-    fn read_from(file: &mut File) -> Result<Self, AppError> {
-        let archive_size = file.metadata()?.len();
-        if archive_size < FOOTER_SIZE {
-            return Err(AppError::from(ArchiveError::ArchiveTooShort));
+    fn from_artifact_footer(mut artifact_footer: Artifact) -> Result<Self, AppError> {
+        let footer_size: u64 = artifact_footer.get_payload_size() as u64;
+
+        if footer_size != FOOTER_DATA_SIZE {
+            return Err(ArchiveError::InvalidTableSize.into());
         }
 
-        file.seek(SeekFrom::Start(archive_size - FOOTER_SIZE))?;
+        let mut magic: [u8; 4] = [0; _];
+        artifact_footer.read_exact(&mut magic)?;
 
-        let mut magic = [0u8; 4];
-        file.read_exact(&mut magic)?;
         if magic != MAGIC {
-            return Err(AppError::from(ArchiveError::InvalidSignature));
+            return Err(ArchiveError::InvalidSignature.into());
         }
 
-        let version = read_u16(file)?;
+        let version = read_u16(&mut artifact_footer)?;
         if version != FORMAT_VERSION {
             return Err(AppError::from(ArchiveError::UnsupportedVersion { version, expected: FORMAT_VERSION }));
         }
 
-        let flags = read_u16(file)?;
+        let flags = read_u16(&mut artifact_footer)?;
         if flags != 0 {
             return Err(AppError::from(ArchiveError::UnknownArchiveFlags { flags }));
         }
 
         let footer = Self {
-            table_offset: read_u64(file)?,
-            table_size: read_u64(file)?,
-            file_count: read_u32(file)?,
-            directory_count: read_u32(file)?,
+            table_start: read_u64(&mut artifact_footer)?,
+            table_size: read_u64(&mut artifact_footer)?,
+            file_count: read_u32(&mut artifact_footer)?,
+            directory_count: read_u32(&mut artifact_footer)?,
         };
-
-        if footer.table_end()? != archive_size - FOOTER_SIZE {
-            return Err(AppError::from(ArchiveError::InvalidTableBounds));
-        }
 
         Ok(footer)
     }
 
     fn table_end(self) -> Result<u64, AppError> {
-        self.table_offset
+        self.table_start
             .checked_add(self.table_size)
             .ok_or_else(|| AppError::from(ArchiveError::TableSizeOverflow))
     }
@@ -243,8 +274,8 @@ fn read_path<Reader: Read>(reader: &mut Reader) -> Result<String, AppError> {
 }
 
 
-fn ensure_inside_table(file: &mut File, table_end: u64) -> Result<(), AppError> {
-    if file.stream_position()? > table_end {
+fn ensure_inside_table<Seekable: Seek>(dest: &mut Seekable, table_end: u64) -> Result<(), AppError> {
+    if dest.stream_position()? > table_end {
         return Err(AppError::from(ArchiveError::EntryOutsideTable));
     }
     Ok(())

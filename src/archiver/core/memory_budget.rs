@@ -11,44 +11,6 @@ pub static MEMORY_BUDGET_IN_BYTES: AtomicI64 = AtomicI64::new(MEMORY_LIMIT_IN_BY
 
 const _: () = assert!(MEMORY_LIMIT_IN_BYTES > 0);
 
-#[cfg(test)]
-static MEMORY_BUDGET_TEST_LOCK: Mutex<()> = Mutex::new(());
-
-
-#[cfg(test)]
-pub(crate) struct TestMemoryBudget {
-    original_budget: i64,
-    _lock: MutexGuard<'static, ()>,
-}
-
-
-#[cfg(test)]
-impl TestMemoryBudget {
-    pub(crate) fn new(available_bytes: i64) -> Self {
-        let lock = MEMORY_BUDGET_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let original_budget = MEMORY_BUDGET_IN_BYTES.swap(available_bytes, Ordering::AcqRel);
-
-        Self {
-            original_budget,
-            _lock: lock,
-        }
-    }
-
-    pub(crate) fn remaining(&self) -> i64 {
-        MEMORY_BUDGET_IN_BYTES.load(Ordering::Acquire)
-    }
-}
-
-
-#[cfg(test)]
-impl Drop for TestMemoryBudget {
-    fn drop(&mut self) {
-        MEMORY_BUDGET_IN_BYTES.store(self.original_budget, Ordering::Release);
-    }
-}
-
 
 // TODO: Его нужно сделать неизменяемым снаружи (interior mutability)?
 pub struct BudgetGuard {
@@ -141,6 +103,45 @@ pub fn show_memory_bar() {
     println!("{} {}", bar, info);
 
     PREV_FILLED.store(filled, Ordering::Relaxed);
+}
+
+
+#[cfg(test)]
+static MEMORY_BUDGET_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+
+#[cfg(test)]
+pub(crate) struct TestMemoryBudget {
+    original_budget: i64,
+    _lock: MutexGuard<'static, ()>,
+}
+
+
+#[cfg(test)]
+impl TestMemoryBudget {
+    pub(crate) fn new(available_bytes: i64) -> Self {
+        let lock = MEMORY_BUDGET_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let original_budget = MEMORY_BUDGET_IN_BYTES.swap(available_bytes, Ordering::AcqRel);
+
+        Self {
+            original_budget,
+            _lock: lock,
+        }
+    }
+
+    pub(crate) fn remaining(&self) -> i64 {
+        MEMORY_BUDGET_IN_BYTES.load(Ordering::Acquire)
+    }
+}
+
+
+#[cfg(test)]
+impl Drop for TestMemoryBudget {
+    fn drop(&mut self) {
+        MEMORY_BUDGET_IN_BYTES.store(self.original_budget, Ordering::Release);
+    }
 }
 
 

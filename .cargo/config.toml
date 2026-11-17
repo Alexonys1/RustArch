@@ -2,3 +2,17 @@
 prof = "samply record cargo run -- --release --bin rustarch"
 test-all = "test -- --include-ignored"
 slow-tests = "test -- --ignored"
+run_pack_battlefield_deflate = [
+    "run", "--release", "--",
+    "pack", 'C:\Games\Battlefield 2142 Novgames RST', "./test_data_for_removing/battlefield.arch",
+    "-c", "deflate",
+]
+run_pack_battlefield_huffman = [
+    "run", "--release", "--",
+    "pack", 'C:\Games\Battlefield 2142 Novgames RST', "./test_data_for_removing/battlefield.arch",
+    "-c", "huffman",
+]
+run_unpack_battlefield = [
+    "run", "--release", "--",
+    "unpack", "./test_data_for_removing/battlefield.arch", "./test_data_for_removing/Battlefield"
+]

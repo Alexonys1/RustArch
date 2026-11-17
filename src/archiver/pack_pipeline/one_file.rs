@@ -2,8 +2,8 @@ use std::sync::mpsc::Sender;
 
 use crate::algorithms::{Cipher, Compressor, ErrorCorrectionCode, PipelineSettings};
 use crate::archiver::{crc32_of_artifact_and_rewind, ArchivedArtifactEntry, Artifact, Crc32, WalkedFile};
-use crate::error::AppError;
 use crate::archiver::PipelineError;
+use crate::error::AppError;
 
 
 /// compress -> encrypt -> fec-encode

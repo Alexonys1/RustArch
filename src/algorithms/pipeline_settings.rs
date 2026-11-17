@@ -59,7 +59,6 @@ const FEC_SHIFT: u32 = 8;
 #[cfg(test)]
 mod tests {
     use crate::error::AppErrorKind;
-
     use super::{CipherId, CompressionId, FecId, PipelineSettings};
 
     #[test]

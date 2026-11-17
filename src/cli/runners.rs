@@ -9,7 +9,7 @@ use crate::archiver::{InputError, PipelineError};
 use crate::algorithms::PipelineSettings;
 use crate::archiver::{ArchivedDirectoryEntry, ArchivedArtifactEntry, Artifact, WalkResult, WalkedFile};
 use crate::archiver::{
-    create_empty_dirs, create_thread_with_queue_writer, pack_files_parallel, read_archive_entries,
+    create_empty_dirs, create_thread_with_queue_writer, pack_files_parallel, read_archive_header,
     unpack_entries_parallel, walk_directory_or_file, write_archive_header,
 };
 use super::{CLICommand, print_help};
@@ -48,6 +48,10 @@ pub fn run_command(command: CLICommand) -> Result<(), AppError> {
     }
 }
 
+
+//TODO: Подумал я тут о бегунах, которых так любил...
+// Как я так круто придумал, что CLI вручную управляет порядком чтения и записи файлов, артефактов и прочего?..
+// Этим должно заниматься ядро архиватора, а CLI ТОЛЬКО передавать необходимые данные и показывать ошибки.
 
 pub fn run_pack(source_path: &Path, target_archive_path: &Path, settings: PipelineSettings, encode_key: &[u8]) -> Result<(), AppError> {
     if !source_path.exists() {
@@ -102,9 +106,7 @@ pub fn run_unpack(archive_path: &Path, unpack_path: &Path, decode_key: &[u8]) ->
         return Err(InputError::ArchiveNotFile { path: archive_path.to_path_buf() }.into());
     }
 
-    let mut archive_file = fs::File::open(archive_path)?;
-    let (files, directories) = read_archive_entries(&mut archive_file)?;
-    drop(archive_file);
+    let (files, directories) = read_archive_header(archive_path)?;
 
     fs::create_dir_all(unpack_path)?;
     create_empty_dirs(unpack_path, &directories)?;
@@ -119,8 +121,7 @@ pub fn run_list(archive_path: &Path) -> Result<(), AppError> {
         return Err(InputError::ArchiveNotFile { path: archive_path.to_path_buf() }.into());
     }
 
-    let mut archive_file = fs::File::open(archive_path)?;
-    let (files, directories) = read_archive_entries(&mut archive_file)?;
+    let (files, directories) = read_archive_header(archive_path)?;
     let total_original = files
         .iter()
         .fold(0u64, |sum, entry| sum.saturating_add(entry.original_size));
