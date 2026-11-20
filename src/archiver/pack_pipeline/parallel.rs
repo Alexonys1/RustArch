@@ -2,9 +2,13 @@ use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::sync::mpsc::Sender;
 use std::thread;
+#[cfg(feature = "statistics")]
+use std::time::{Duration, Instant};
 
 use crate::algorithms::PipelineSettings;
 use crate::archiver::{ArchivedArtifactEntry, Artifact, WalkedFile};
+#[cfg(feature = "statistics")]
+use crate::archiver::statistics_println;
 use crate::error::AppError;
 use crate::archiver::PipelineError;
 use super::one_file::pack_file;
@@ -17,30 +21,97 @@ pub fn pack_files_parallel(
     pipeline_settings: PipelineSettings,
     encode_key: &[u8],
     artifact_sender: Sender<(ArchivedArtifactEntry, Artifact)>,
+    #[cfg(feature = "statistics")] start_program_time: Instant,
 ) -> Result<(), AppError>
 {
-    let groups_of_files = group_files_for_workers(&files, MAX_PARALLELISM)?;
+    #[cfg(feature = "statistics")]
+    let grouping_started_at  = start_program_time.elapsed();
 
+    let groups_of_files: Vec<Vec<&WalkedFile>> = group_files_for_workers(&files, MAX_PARALLELISM)?;
+
+    #[cfg(feature = "statistics")]
+    {
+        let grouping_duration = start_program_time.elapsed() - grouping_started_at;
+        statistics_println!("===> Начало группировки: {:?} | Длительность: {:?}", grouping_started_at, grouping_duration);
+    }
+
+
+    #[cfg(feature = "statistics")]
+    let mut groups_of_files_with_running_time: Vec<Vec<(WalkedFile, Duration, Duration)>> = Vec::with_capacity(groups_of_files.len());
+
+
+    let scope_result: Result<(), AppError> =
     thread::scope(|scope| {
         let mut workers = Vec::with_capacity(groups_of_files.len());
 
         for file_group in &groups_of_files {
             workers.push(scope.spawn(|| {
-                pack_file_group(file_group, pipeline_settings, encode_key, artifact_sender.clone())
+                pack_file_group(file_group, pipeline_settings, encode_key, artifact_sender.clone(), #[cfg(feature = "statistics")] start_program_time)
             }));
         }
 
         for worker in workers {
-            worker
+            #[allow(unused)]
+            let files_with_running_time = worker
                 .join()
                 .map_err(|_| PipelineError::WorkerPanicked)??;
+
+            #[cfg(feature = "statistics")]
+            groups_of_files_with_running_time.push(files_with_running_time);
         }
 
         Ok(())
-    })
+    });
+
+    drop(artifact_sender); // Для того, чтобы вывод статистки не замедлял работу программы.
+
+    // Обработаем статистику прямо здесь, не поднимая её наверх. Здесь у нас уже есть все необходимые данные:
+    #[cfg(feature = "statistics")]
+    {
+        statistics_println!("Номера потоков условны и не привязаны к физическим ядрам процессора и тому подобному!");
+
+        for (i, group) in (1..).zip(groups_of_files_with_running_time) {
+            statistics_println!("ПОТОК #{i})\n{group:#?}\n");
+        }
+    }
+
+    scope_result
 }
 
 
+#[cfg(feature = "statistics")]
+fn pack_file_group(
+    file_group: &[&WalkedFile],
+    pipeline_settings: PipelineSettings,
+    encode_key: &[u8],
+    artifact_sender: Sender<(ArchivedArtifactEntry, Artifact)>,
+    start_program_time: Instant,
+) -> Result<Vec<(WalkedFile, Duration, Duration)>, AppError>
+{
+    let mut files_with_running_time: Vec<(WalkedFile, Duration, Duration)> = Vec::with_capacity(file_group.len());
+
+    for file in file_group {
+        // Замеряя время прохождения одного файла через пайплайн, мы можем посчитать и суммарное время работы всего потока (работника).
+        let started_at = start_program_time.elapsed();
+
+        pack_file(file, pipeline_settings, encode_key, artifact_sender.clone())?;
+
+        let duration = start_program_time.elapsed() - started_at;
+
+        files_with_running_time.push(
+            (
+                (**file).clone(),  // На самом деле можно обойтись и одной :D
+                started_at,
+                duration,
+            )
+        );
+    }
+
+    Ok(files_with_running_time)
+}
+
+
+#[cfg(not(feature = "statistics"))]
 fn pack_file_group(
     file_group: &[&WalkedFile],
     pipeline_settings: PipelineSettings,
@@ -49,7 +120,7 @@ fn pack_file_group(
 ) -> Result<(), AppError>
 {
     for file in file_group {
-        pack_file(file, pipeline_settings, encode_key, artifact_sender.clone())?
+        pack_file(file, pipeline_settings, encode_key, artifact_sender.clone())?;
     }
 
     Ok(())

@@ -1,0 +1,6 @@
+[tasks.statistics]
+command = "python3"
+args = ["plot_statistics.py", "test_data_for_removing/statistics.txt"]
+
+[tasks.statistics.windows]
+command = "python"

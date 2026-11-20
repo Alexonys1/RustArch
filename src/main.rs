@@ -120,6 +120,7 @@ fn run_quick_grouping() -> Result<(), AppError> {
     let started = Instant::now();
     let walked_files: Vec<WalkedFile> = walk_directory_or_file(Path::new(QUICK_SOURCE_PATH))?.files;
     let groups = group_files_for_workers(&walked_files, QUICK_WORKERS_FOR_GROUPING)?;
+    let elapsed = started.elapsed();
 
     println!("{} {}", "Групп:".bold(), groups.len().to_string().cyan());
     for (index, group) in groups.iter().enumerate() {
@@ -138,7 +139,7 @@ fn run_quick_grouping() -> Result<(), AppError> {
     println!(
         "{} {}",
         "Время группировки + чтение файловых директорий:".bold(),
-        format!("{}ms", started.elapsed().as_millis()).cyan(),
+        format!("{}ms", elapsed.as_millis()).cyan(),
     );
 
     Ok(())

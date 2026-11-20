@@ -5,8 +5,10 @@ use crate::error::AppError;
 use crate::archiver::InputError;
 
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct WalkedFile {
+    /// Важная ремарка: если путь указан как `.\something`, то он и будет абсолютным.
+    /// Никто его не кастит до вида `C:\...\something`
     pub absolute_path: PathBuf,
     /// Путь относительно корня архивации, всегда с '/'-разделителем.
     pub relative_path: String,

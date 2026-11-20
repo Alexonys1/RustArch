@@ -1,11 +1,15 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, channel};
+#[cfg(feature = "statistics")]
+use std::time::Instant;
 
 use owo_colors::OwoColorize;
 
 use crate::error::AppError;
 use crate::archiver::{InputError, PipelineError};
+#[cfg(feature = "statistics")]
+use crate::archiver::statistics_println;
 use crate::algorithms::PipelineSettings;
 use crate::archiver::{ArchivedDirectoryEntry, ArchivedArtifactEntry, Artifact, WalkResult, WalkedFile};
 use crate::archiver::{
@@ -62,8 +66,7 @@ pub fn run_pack(source_path: &Path, target_archive_path: &Path, settings: Pipeli
         return Err(InputError::SameInputAndOutput { input: source_path.to_path_buf(), output: target_archive_path.to_path_buf() }.into());
     }
 
-    if source_path.is_dir()
-        && canonical_or_absolute(target_archive_path)?.starts_with(fs::canonicalize(source_path)?)
+    if source_path.is_dir() && canonical_or_absolute(target_archive_path)?.starts_with(fs::canonicalize(source_path)?)
     {
         return Err(InputError::ArchiveInsideSource { archive: target_archive_path.to_path_buf(), directory: source_path.to_path_buf() }.into());
     }
@@ -75,26 +78,50 @@ pub fn run_pack(source_path: &Path, target_archive_path: &Path, settings: Pipeli
         fs::create_dir_all(parent)?;
     }
 
+    #[cfg(feature = "statistics")]
+    let start_program_time = Instant::now();
+
+
     let walked_targets: WalkResult = walk_directory_or_file(&source_path)?;
     let target_files: Vec<WalkedFile> = walked_targets.files;
     let archived_directories: Vec<ArchivedDirectoryEntry> = walked_targets.empty_dirs;
+
+    #[cfg(feature = "statistics")]
+    statistics_println!("===> Чтение директорий. Начало: УСЛОВНЫЙ НОЛЬ. Длительность: {:?}", start_program_time.elapsed());
+
 
     let (sender, receiver): (
         Sender<(ArchivedArtifactEntry, Artifact)>,
         Receiver<(ArchivedArtifactEntry, Artifact)>,
     ) = channel();
 
-    let handler_of_artifact_writer = create_thread_with_queue_writer(target_archive_path.to_path_buf(), receiver);
-    let parallel_result = pack_files_parallel(target_files, settings, &encode_key, sender);
+    let handler_of_artifact_writer = create_thread_with_queue_writer(target_archive_path.to_path_buf(), receiver, #[cfg(feature = "statistics")] start_program_time);
+    let parallel_result = pack_files_parallel(target_files, settings, &encode_key, sender, #[cfg(feature = "statistics")] start_program_time);
 
     // Здесь мы ждём пока все артефакты не будут записаны в архив. Только после этого записываем заголовок:
     let archived_files = handler_of_artifact_writer
         .join()
         .map_err(|_| PipelineError::WriterPanicked)??;
 
+
+    #[cfg(feature = "statistics")]
+    let writing_started_at = start_program_time.elapsed();
+
     // Лучше проверить сначала отсутствие ошибок у потока, который пишет конечный архив,
     // а потом проверить другие потоки, потому что они зависят от него.
     write_archive_header(target_archive_path, archived_files, archived_directories)?;
+
+    #[cfg(feature = "statistics")]
+    let writing_duration = start_program_time.elapsed() - writing_started_at;
+
+    #[cfg(feature = "statistics")]
+    statistics_println!(
+        "===> Формирование и запись footer. Начало {:?} | Длительность: {:?}",
+        writing_started_at,
+        writing_duration,
+    );
+
+
     parallel_result?;
 
     Ok(())

@@ -4,7 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [profile.dev]
-opt-level = 1
+opt-level = 0
+codegen-units = 2
 
 [profile.release]
 opt-level = 3
@@ -14,13 +15,17 @@ codegen-units = 1 # Бустит скорость больше, чем на 0.5�
 #panic = "abort"
 #strip = true
 
-[profile.samply]
-inherits = "release"
-debug = true
-
 [dependencies]
 owo-colors = "4"
 thiserror = "2"
+
+[features]
+default = ["statistics"]
+statistics = []
+
+[profile.samply]
+inherits = "release"
+debug = true
 
 [target.'cfg(windows)'.dependencies]
 enable-ansi-support = "0"
