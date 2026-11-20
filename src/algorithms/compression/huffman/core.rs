@@ -176,12 +176,7 @@ impl HuffmanCompressor {
         }
         artifact.rewind_cursor();
 
-        let nonzero_freqs: Vec<SymbolWithFreq> = freqs
-            .into_iter()
-            .enumerate()
-            .filter(|&(_, f)| f > 0)
-            .map(|(symbol, f)| SymbolWithFreq { symbol: symbol as u8, freq: f })
-            .collect();
+        let nonzero_freqs = nonzero_frequencies(freqs);
         // ============================== СЧИТАЕМ ЧАСТОТЫ ================================
 
 
@@ -215,10 +210,7 @@ impl HuffmanCompressor {
 
 
         // =============== ЕЩЁ ОДНА ЭВРИСТИКА ДЛЯ ОТКЛОНЕНИЯ НЕСЖИМАЕМОГО ФАЙЛА ====================
-        let encoded_bits: u64 = nonzero_freqs
-            .iter()
-            .map(|entry| codes[entry.symbol as usize].len as u64 * entry.freq)
-            .sum();
+        let encoded_bits = encoded_bit_count(&nonzero_freqs, &codes);
         let encoded_size = header_bytes + encoded_bits.div_ceil(8);
 
         if allow_passthrough && encoded_size >= original_size {
@@ -255,4 +247,20 @@ fn write_header(output: &mut Artifact, nonzero_freqs: &[SymbolWithFreq]) -> Resu
     }
 
     Ok(())
+}
+
+fn nonzero_frequencies(freqs: [u64; ALPHABET_SIZE]) -> Vec<SymbolWithFreq> {
+    freqs
+        .into_iter()
+        .enumerate()
+        .filter(|&(_, f)| f > 0)
+        .map(|(symbol, f)| SymbolWithFreq { symbol: symbol as u8, freq: f })
+        .collect()
+}
+
+fn encoded_bit_count(nonzero_freqs: &[SymbolWithFreq], codes: &[HuffmanCode; ALPHABET_SIZE]) -> u64 {
+    nonzero_freqs
+        .iter()
+        .map(|entry| codes[entry.symbol as usize].len as u64 * entry.freq)
+        .sum()
 }

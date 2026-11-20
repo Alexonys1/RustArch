@@ -1,5 +1,7 @@
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
+use std::fs::File;
+use std::io::{self, Read, Seek, SeekFrom};
 use std::sync::mpsc::Sender;
 use std::thread;
 #[cfg(feature = "statistics")]
@@ -140,33 +142,119 @@ pub fn group_files_for_workers(files: &[WalkedFile], max_parallelism: usize) -> 
         .min(files.len())
         .min(max_parallelism);
 
-    let mut sized_files = Vec::with_capacity(files.len());
+    let mut sample = [0u8; PROBE_SIZE];
+    let mut weighted_files: Vec<(f64, &WalkedFile)> = Vec::with_capacity(files.len());
+
     for file in files {
-        sized_files.push((file.get_size()?, file));
-    }
-    sized_files.sort_by_key(|&(size, _)| Reverse(size));
-
-    let mut groups: Vec<Vec<(u64, &WalkedFile)>> =
-        (0..number_of_workers).map(|_| Vec::new()).collect();
-    let mut heap: BinaryHeap<Reverse<(u64, usize)>> =
-        (0..number_of_workers).map(|i| Reverse((0, i))).collect();
-
-    for (size, file) in sized_files {
-        let Reverse((total_size, group_idx)) = heap.pop().unwrap();
-        groups[group_idx].push((size, file));
-        heap.push(Reverse((total_size + size, group_idx)));
+        let mut input = File::open(&file.absolute_path)?;
+        let size = input.metadata()?.len();
+        let weight = file_weight(&mut input, size, &mut sample)?;
+        weighted_files.push((weight, file));
     }
 
-    for group in &mut groups {
-        group.sort_by_key(|&(size, _)| Reverse(size));
-    }
+    weighted_files.sort_by(|left, right| right.0.total_cmp(&left.0));
 
-    let result = groups
-        .into_iter()
-        .map(|group| group.into_iter().map(|(_, file)| file).collect())
+    let mut groups = vec![Vec::new(); number_of_workers];
+
+    let mut loads: BinaryHeap<_> = (0..number_of_workers)
+        .map(|worker| Reverse((0.0_f64.to_bits(), 0usize, worker)))
         .collect();
 
-    //println!("{result:#?}");
+    for (weight, file) in weighted_files {
+        let Reverse((load_bits, count, worker)) = loads.pop().unwrap();
+        groups[worker].push(file);
+        let load = f64::from_bits(load_bits) + weight;
+        loads.push(Reverse((load.to_bits(), count + 1, worker)));
+    }
 
-    Ok(result)
+    Ok(groups)
+}
+
+
+const PROBE_SIZE: usize = 4 * 1024;
+
+
+fn file_weight(input: &mut (impl Read + Seek), size: u64, buffer: &mut [u8; PROBE_SIZE]) -> io::Result<f64> {
+    if size == 0 {
+        return Ok(0.0);
+    }
+
+    let sampled = size.min(3 * PROBE_SIZE as u64) as usize;
+    let edge = sampled / 3;
+    let lengths = if sampled <= PROBE_SIZE {
+        [sampled, 0, 0]
+    }
+    else {
+        [
+            edge,
+            sampled - edge - sampled.div_ceil(3),
+            sampled.div_ceil(3),
+        ]
+    };
+
+    let offsets = [0, (size - lengths[1] as u64) / 2, size - lengths[2] as u64];
+    let mut matched = 0;
+    let mut position = 0;
+
+    for (offset, length) in offsets.into_iter().zip(lengths) {
+        if length == 0 {
+            continue;
+        }
+
+        if offset != position {
+            input.seek(SeekFrom::Start(offset))?;
+        }
+
+        let region = &mut buffer[..length];
+
+        input.read_exact(region)?;
+        matched += lzss_matched_bytes(region);
+        position = offset + length as u64;
+    }
+
+    // При размере 4 МиБ множитель резерва равен двум. Так потоку с крупным
+    // файлом обычно достаётся меньше дополнительной работы.
+    const RESERVE_SCALE_BYTES: f64 = 4.0 * 1024.0 * 1024.0;
+
+    let size = size as f64;
+    let match_ratio = matched as f64 / sampled as f64;
+
+    Ok(size * (1.0 + match_ratio) * (1.0 + size / RESERVE_SCALE_BYTES))
+}
+
+
+/// Считает байты, покрытые совпадениями.
+fn lzss_matched_bytes(data: &[u8]) -> usize {
+    const WINDOW: usize = 4096;
+    const MAX_MATCH: usize = 258;
+    const HASH_BITS: u32 = 10;
+
+    let mut latest = [usize::MAX; 1 << HASH_BITS];
+    let mut matched = 0;
+    let mut pos = 0;
+
+    while pos + 3 <= data.len() {
+        let key = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], 0]);
+        let slot = (key.wrapping_mul(0x9e37_79b1) >> (32 - HASH_BITS)) as usize;
+        let previous = std::mem::replace(&mut latest[slot], pos);
+        if previous == usize::MAX
+            || pos - previous > WINDOW
+            || data[previous..previous + 3] != data[pos..pos + 3]
+        {
+            pos += 1;
+            continue;
+        }
+
+        let limit = MAX_MATCH.min(data.len() - pos);
+        let mut length = 3;
+
+        while length < limit && data[previous + length] == data[pos + length] {
+            length += 1;
+        }
+
+        matched += length;
+        pos += length;
+    }
+
+    matched
 }
