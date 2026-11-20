@@ -115,11 +115,13 @@ fn main() {
 // ===================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ БЫСТРОГО ТЕСТИРОВАНИЯ =========================
 // Очень лень писать скрипты с разными командами для архиватора...
 fn run_quick_grouping() -> Result<(), AppError> {
-    use rustarch::archiver::{WalkedFile, group_files_for_workers, walk_directory_or_file};
+    todo!();
+    /*
+    use rustarch::archiver::{WalkedFile, make_file_queue, walk_directory_or_file};
 
     let started = Instant::now();
     let walked_files: Vec<WalkedFile> = walk_directory_or_file(Path::new(QUICK_SOURCE_PATH))?.files;
-    let groups = group_files_for_workers(&walked_files, QUICK_WORKERS_FOR_GROUPING)?;
+    let groups = make_file_queue(&walked_files, QUICK_WORKERS_FOR_GROUPING)?;
     let elapsed = started.elapsed();
 
     println!("{} {}", "Групп:".bold(), groups.len().to_string().cyan());
@@ -143,4 +145,5 @@ fn run_quick_grouping() -> Result<(), AppError> {
     );
 
     Ok(())
+     */
 }

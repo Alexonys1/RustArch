@@ -19,7 +19,7 @@ pub fn pack_file(
     file: &WalkedFile,
     pipeline_settings: PipelineSettings,
     encode_key: &[u8],
-    artifact_sender: Sender<(ArchivedArtifactEntry, Artifact)>,
+    artifact_sender: &Sender<(ArchivedArtifactEntry, Artifact)>,
 ) -> Result<(), AppError>
 {
     let mut artifact = Artifact::from_file(file.absolute_path.as_ref())?;

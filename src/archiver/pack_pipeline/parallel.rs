@@ -1,5 +1,5 @@
 use std::cmp::Reverse;
-use std::collections::BinaryHeap;
+use std::sync::{Arc, Mutex};
 use std::sync::mpsc::Sender;
 use std::thread;
 #[cfg(feature = "statistics")]
@@ -27,7 +27,8 @@ pub fn pack_files_parallel(
     #[cfg(feature = "statistics")]
     let grouping_started_at  = start_program_time.elapsed();
 
-    let groups_of_files: Vec<Vec<&WalkedFile>> = group_files_for_workers(&files, MAX_PARALLELISM)?;
+    let number_of_threads: usize = calc_number_of_threads(&files);
+    let sorted_files: Arc<Mutex<std::vec::IntoIter<WalkedFile>>> = make_file_queue(files)?;
 
     #[cfg(feature = "statistics")]
     {
@@ -37,16 +38,18 @@ pub fn pack_files_parallel(
 
 
     #[cfg(feature = "statistics")]
-    let mut groups_of_files_with_running_time: Vec<Vec<(WalkedFile, Duration, Duration)>> = Vec::with_capacity(groups_of_files.len());
+    let mut groups_of_files_with_running_time: Vec<Vec<(WalkedFile, Duration, Duration)>> = Vec::with_capacity(number_of_threads);
 
 
     let scope_result: Result<(), AppError> =
     thread::scope(|scope| {
-        let mut workers = Vec::with_capacity(groups_of_files.len());
+        let mut workers = Vec::with_capacity(number_of_threads);
 
-        for file_group in &groups_of_files {
+        for _ in 0..number_of_threads {
             workers.push(scope.spawn(|| {
-                pack_file_group(file_group, pipeline_settings, encode_key, artifact_sender.clone(), #[cfg(feature = "statistics")] start_program_time)
+                pack_file_group(sorted_files.clone(), pipeline_settings, encode_key, artifact_sender.clone(), #[cfg(
+                    feature = "statistics"
+                )] start_program_time)
             }));
         }
 
@@ -81,92 +84,80 @@ pub fn pack_files_parallel(
 
 #[cfg(feature = "statistics")]
 fn pack_file_group(
-    file_group: &[&WalkedFile],
+    files: Arc<Mutex<std::vec::IntoIter<WalkedFile>>>,
     pipeline_settings: PipelineSettings,
     encode_key: &[u8],
     artifact_sender: Sender<(ArchivedArtifactEntry, Artifact)>,
     start_program_time: Instant,
 ) -> Result<Vec<(WalkedFile, Duration, Duration)>, AppError>
 {
-    let mut files_with_running_time: Vec<(WalkedFile, Duration, Duration)> = Vec::with_capacity(file_group.len());
+    let mut files_with_running_time: Vec<(WalkedFile, Duration, Duration)> = Vec::with_capacity(files.lock().unwrap().len());
 
-    for file in file_group {
-        // Замеряя время прохождения одного файла через пайплайн, мы можем посчитать и суммарное время работы всего потока (работника).
+    loop {
+        let next_file = files.lock().unwrap().next();
+
+        let Some(file) = next_file else {
+            return Ok(files_with_running_time)
+        };
+
         let started_at = start_program_time.elapsed();
+        pack_file(&file, pipeline_settings, encode_key, &artifact_sender)?;
+        let pack_duration = start_program_time.elapsed() - started_at;
 
-        pack_file(file, pipeline_settings, encode_key, artifact_sender.clone())?;
-
-        let duration = start_program_time.elapsed() - started_at;
-
-        files_with_running_time.push(
-            (
-                (**file).clone(),  // На самом деле можно обойтись и одной :D
-                started_at,
-                duration,
-            )
-        );
+        files_with_running_time.push((file, started_at, pack_duration));
     }
-
-    Ok(files_with_running_time)
 }
 
 
 #[cfg(not(feature = "statistics"))]
 fn pack_file_group(
-    file_group: &[&WalkedFile],
+    files: Arc<Mutex<std::vec::IntoIter<WalkedFile>>>,
     pipeline_settings: PipelineSettings,
     encode_key: &[u8],
     artifact_sender: Sender<(ArchivedArtifactEntry, Artifact)>,
 ) -> Result<(), AppError>
 {
-    for file in file_group {
-        pack_file(file, pipeline_settings, encode_key, artifact_sender.clone())?;
+    loop {
+        let next_file: Option<WalkedFile> = files.lock().expect("Мьютекс общей очереди отравлен!").next();
+
+        let Some(file) = next_file
+        else {
+            break
+        };
+
+        pack_file(&file, pipeline_settings, encode_key, &artifact_sender)?;
     }
 
     Ok(())
 }
 
 
-pub fn group_files_for_workers(files: &[WalkedFile], max_parallelism: usize) -> Result<Vec<Vec<&WalkedFile>>, AppError> {
-    assert!(max_parallelism > 0);
-
+pub fn make_file_queue(files: Vec<WalkedFile>) -> Result<Arc<Mutex<std::vec::IntoIter<WalkedFile>>>, AppError> {
     if files.is_empty() {
-        return Ok(Vec::new());
+        return Ok(Arc::new(Mutex::new(Vec::new().into_iter())));
     }
 
-    let number_of_workers = thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
+    // Отсортируем файлы по их размеру по убыванию.
+    // Так лучше, потому что потоки будут брать сначала самые тяжёлые файлы на обработку,
+    // оставляя маленькие на потом.
+    let mut sized_files: Vec<(&WalkedFile, u64)> = Vec::with_capacity(files.len());
+    for file in files.iter() {
+        let file_size: u64 = file.get_size()?;
+        sized_files.push((file, file_size));
+    }
+
+    sized_files.sort_by_key(|f| Reverse(f.1));
+
+    let sorted_files: Vec<WalkedFile> = sized_files.into_iter().map(|f| f.0.clone()).collect();
+
+    Ok(
+        Arc::new(Mutex::new(sorted_files.into_iter()))
+    )
+}
+
+
+fn calc_number_of_threads(files: &[WalkedFile]) -> usize {
+    thread::available_parallelism().expect("Нельзя узнать кол-во доступных потоков у ОС!").get()
+        .min(MAX_PARALLELISM)
         .min(files.len())
-        .min(max_parallelism);
-
-    let mut sized_files = Vec::with_capacity(files.len());
-    for file in files {
-        sized_files.push((file.get_size()?, file));
-    }
-    sized_files.sort_by_key(|&(size, _)| Reverse(size));
-
-    let mut groups: Vec<Vec<(u64, &WalkedFile)>> =
-        (0..number_of_workers).map(|_| Vec::new()).collect();
-    let mut heap: BinaryHeap<Reverse<(u64, usize)>> =
-        (0..number_of_workers).map(|i| Reverse((0, i))).collect();
-
-    for (size, file) in sized_files {
-        let Reverse((total_size, group_idx)) = heap.pop().unwrap();
-        groups[group_idx].push((size, file));
-        heap.push(Reverse((total_size + size, group_idx)));
-    }
-
-    for group in &mut groups {
-        group.sort_by_key(|&(size, _)| Reverse(size));
-    }
-
-    let result = groups
-        .into_iter()
-        .map(|group| group.into_iter().map(|(_, file)| file).collect())
-        .collect();
-
-    //println!("{result:#?}");
-
-    Ok(result)
 }
