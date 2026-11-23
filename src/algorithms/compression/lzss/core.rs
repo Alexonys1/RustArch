@@ -121,7 +121,7 @@ impl LzssCompressor {
         let original_size = artifact.get_payload_size() as u64;
 
         let mut window = SlidingWindow::new(WINDOW_SIZE, LOOKAHEAD_SIZE)?;
-        let mut chain = HashChain::new(WINDOW_SIZE)?;
+        let mut chain = HashChain::new(WINDOW_SIZE);
 
         let mut out_buf: Vec<u8> = Vec::with_capacity(OUTPUT_FLUSH_SIZE);
         let mut group = TokenGroupWriter::new();

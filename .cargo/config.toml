@@ -11,7 +11,7 @@ run_fast_pack = [
 
 run_test_data = [
     "run", "--release", "--",
-    "pack", 'C:\Users\alex\Desktop\Учёба\Тестовые данные для архиватора', "./test_data_for_removing/test_data.arch",
+    "pack", 'C:\Users\alex\Desktop\Учёба\Тестовые данные для архиватора\Смешанное', "./test_data_for_removing/test_data.arch",
 ]
 
 run_pack_battlefield_deflate = [

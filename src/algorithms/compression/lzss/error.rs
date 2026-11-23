@@ -9,12 +9,6 @@ pub enum LzssError {
     #[error("Переполнение при вычислении размера скользящего окна")]
     WindowSizeOverflow,
 
-    #[error("Не удалось зарезервировать {bytes} байт под скользящее окно: бюджет памяти исчерпан")]
-    WindowMemoryBudgetExceeded { bytes: usize },
-
-    #[error("Не удалось зарезервировать {bytes} байт под хэш-таблицу: бюджет памяти исчерпан")]
-    HashTableMemoryBudgetExceeded { bytes: usize },
-
     #[error("Недостаточная ёмкость скользящего окна")]
     InsufficientWindowCapacity,
 

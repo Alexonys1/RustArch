@@ -9,8 +9,6 @@ use owo_colors::OwoColorize;
 pub const MEMORY_LIMIT_IN_BYTES: i64 = 6 * 1024_i64.pow(3); // 6GB
 pub static MEMORY_BUDGET_IN_BYTES: AtomicI64 = AtomicI64::new(MEMORY_LIMIT_IN_BYTES);
 
-const _: () = assert!(MEMORY_LIMIT_IN_BYTES > 0);
-
 
 // TODO: Его нужно сделать неизменяемым снаружи (interior mutability)?
 pub struct BudgetGuard {

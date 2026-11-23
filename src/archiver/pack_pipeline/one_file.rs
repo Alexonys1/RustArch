@@ -1,5 +1,9 @@
+#[cfg(feature = "ignore_compressed_extensions")]
+use std::path::Path;
 use std::sync::mpsc::Sender;
 
+#[cfg(feature = "ignore_compressed_extensions")]
+use crate::algorithms::CompressionId;
 use crate::algorithms::{Cipher, Compressor, ErrorCorrectionCode, PipelineSettings};
 use crate::archiver::{crc32_of_artifact_and_rewind, ArchivedArtifactEntry, Artifact, Crc32, WalkedFile};
 use crate::archiver::PipelineError;
@@ -41,6 +45,9 @@ pub fn pack_file(
 
     let crc32: u32 = crc32_of_artifact_and_rewind(&mut artifact, pipeline_settings)?;
 
+    #[cfg(feature = "ignore_compressed_extensions")]
+    let compressor: Box<dyn Compressor> = needed_compression(&file.absolute_path, pipeline_settings).get();
+    #[cfg(not(feature = "ignore_compressed_extensions"))]
     let compressor: Box<dyn Compressor> = pipeline_settings.compression.get();
     let cipher: Box<dyn Cipher> = pipeline_settings.cipher.get();
     let fec: Box<dyn ErrorCorrectionCode> = pipeline_settings.fec.get();
@@ -68,4 +75,19 @@ pub fn pack_file(
         .map_err(|_| PipelineError::WriterQueueClosed)?;
 
     Ok(())
+}
+
+
+#[cfg(feature = "ignore_compressed_extensions")]
+fn needed_compression(path: &Path, pipeline_settings: PipelineSettings) -> CompressionId {
+    const EXTENSIONS: &[&str] = &[
+        "zip", "7z", "rar", "gz", "bz2", "xz", "zst", "cab",
+        "jpg", "jpeg", "png", "webp", "mp3", "flac", "ogg", "bik",
+    ];
+
+    let usually_compressed = path.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| {
+        EXTENSIONS.iter().any(|candidate| ext.eq_ignore_ascii_case(candidate))
+    });
+
+    if usually_compressed { CompressionId::NoCompression } else { pipeline_settings.compression }
 }

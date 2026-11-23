@@ -22,6 +22,7 @@ thiserror = "2"
 [features]
 default = ["statistics"]
 statistics = []
+ignore_compressed_extensions = []
 
 [profile.samply]
 inherits = "release"

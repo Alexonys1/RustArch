@@ -2,7 +2,6 @@ use super::LzssError;
 
 use crate::error::AppError;
 use crate::archiver::Artifact;
-use crate::archiver::memory_budget::BudgetGuard;
 
 
 /// Размер блока чтения
@@ -17,7 +16,6 @@ pub struct SlidingWindow {
     exhausted: bool,
     window_size: usize,
     capacity: usize,
-    _guard: BudgetGuard,
 }
 
 impl SlidingWindow {
@@ -26,17 +24,12 @@ impl SlidingWindow {
             .checked_add(INPUT_READ_SIZE)
             .and_then(|v| v.checked_add(lookahead_size))
             .ok_or(LzssError::WindowSizeOverflow)?;
-        let mut guard = BudgetGuard::default();
-        if !guard.try_grow(capacity as i64) {
-            return Err(LzssError::WindowMemoryBudgetExceeded { bytes: capacity }.into());
-        }
         Ok(Self {
             buffer: Vec::with_capacity(capacity),
             base_pos: 0,
             exhausted: false,
             window_size,
             capacity,
-            _guard: guard,
         })
     }
 
@@ -117,22 +110,15 @@ pub struct HashChain {
     head: Vec<u64>,
     prev: Vec<u64>,
     window_size: usize,
-    _guard: BudgetGuard,
 }
 
 impl HashChain {
-    pub fn new(window_size: usize) -> Result<Self, AppError> {
-        let bytes = (HASH_SIZE + window_size) * std::mem::size_of::<u64>();
-        let mut guard = BudgetGuard::default();
-        if !guard.try_grow(bytes as i64) {
-            return Err(LzssError::HashTableMemoryBudgetExceeded { bytes }.into());
-        }
-        Ok(Self {
+    pub fn new(window_size: usize) -> Self {
+        Self {
             head: vec![NONE; HASH_SIZE],
             prev: vec![NONE; window_size],
             window_size,
-            _guard: guard,
-        })
+        }
     }
 
     fn hash3(b0: u8, b1: u8, b2: u8) -> usize {
